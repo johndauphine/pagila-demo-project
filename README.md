@@ -44,34 +44,43 @@ docker run -d \
   postgres:16
 ```
 
+The Astro runtime creates a project-specific bridge network (for example `pagila-demo-project_xxxxx_airflow`). Attach both Postgres containers so the scheduler can resolve them by container name:
+
+```bash
+docker network connect <astro_airflow_network> pagila-pg-source
+docker network connect <astro_airflow_network> pagila-pg-target
+```
+
+> To discover the exact network name run `docker network ls` after `astro dev start`.
+
 ---
 
 ## 4. Create Airflow Connections
 You can use `astro dev run connections ...` (note: with some Astro versions the `airflow` keyword is implicit).
 
-**Source connection (to the container above on 5433):**
+**Source connection (resolves via Docker network name):**
 ```bash
 astro dev run connections add pagila_postgres \
   --conn-type postgres \
-  --conn-host host.docker.internal \
-  --conn-port 5433 \
+    --conn-host pagila-pg-source \
+    --conn-port 5432 \
   --conn-login pagila \
   --conn-password pagila_pw \
   --conn-schema pagila
 ```
 
-**Target connection (to the container above on 5444):**
+**Target connection:**
 ```bash
 astro dev run connections add pagila_tgt \
   --conn-type postgres \
-  --conn-host host.docker.internal \
-  --conn-port 5444 \
+    --conn-host pagila-pg-target \
+    --conn-port 5432 \
   --conn-login pagila_tgt \
   --conn-password pagila_tgt_pw \
   --conn-schema pagila
 ```
 
-> If your source DB is reachable via the Astro network as a service called `postgres` on port `5432`, use `--conn-host postgres --conn-port 5432` instead.
+> On Docker Desktop you can still point at the mapped host ports by swapping `--conn-host` for `host.docker.internal` and using ports `5433`/`5444`.
 
 ---
 
@@ -82,6 +91,13 @@ include/pagila/schema.sql
 include/pagila/data.sql
 ```
 Ensure `data.sql` uses `COPY ... FROM stdin;` blocks with a terminating `\.` line for each section (download a **raw** file from the official repo).
+
+Download the canonical files straight from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-schema.sql -o include/pagila/schema.sql
+curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-data.sql -o include/pagila/data.sql
+```
 
 ---
 
@@ -502,6 +518,10 @@ with DAG(
 ## 8. Running the DAGs
 ```bash
 astro dev start
+
+# Unpause the DAGs once they appear
+astro dev run dags unpause -y load_pagila_to_postgres
+astro dev run dags unpause -y replicate_pagila_to_target
 
 # Load source
 astro dev run dags trigger load_pagila_to_postgres
