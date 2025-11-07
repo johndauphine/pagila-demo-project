@@ -20,7 +20,9 @@ Then rebuild/restart your Astro environment:
 astro dev restart
 ```
  
-## 3. Start Source and Target Postgres Containers (no Docker Compose)
+## 3. Start Source and Target Database Containers
+
+### 3.1 Start Source Postgres Container
 Start **source** on host port **5433**:
 ```bash
 docker run -d \
@@ -32,7 +34,12 @@ docker run -d \
   postgres:16
 ```
 
-Start **target** on host port **5444**:
+### 3.2 Start Target Database Container
+
+You have two options for the target database:
+
+#### Option A: Postgres Target (Default)
+Start **Postgres target** on host port **5444**:
 ```bash
 docker run -d \
   --name pagila-pg-target \
@@ -43,17 +50,55 @@ docker run -d \
   postgres:16
 ```
 
-The Astro runtime creates a project-specific bridge network (for example `pagila-demo-project_xxxxx_airflow`). Attach both Postgres containers so the scheduler can resolve them by container name:
-
+#### Option B: SQL Server Target (Alternative)
+Start **Azure SQL Edge target** (ARM64/AMD64 compatible) on host port **1433**:
 ```bash
-docker network connect <astro_airflow_network> pagila-pg-source
-docker network connect <astro_airflow_network> pagila-pg-target
+docker run -d \
+  --name pagila-mssql-target \
+  -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=PagilaPass123!" \
+  -p 1433:1433 \
+  mcr.microsoft.com/azure-sql-edge:latest
 ```
 
-> To discover the exact network name run `astro dev start`, then `docker network ls | grep astro`. If you prefer `docker compose`, you can wrap these two services in a compose file as long as it joins the same Astro network.
+> **Note**: Azure SQL Edge is recommended over SQL Server 2022 for ARM64 (Apple Silicon) compatibility. For production, use full SQL Server 2022 on AMD64.
+
+### 3.3 Connect to Astro Network
+
+The Astro runtime creates a project-specific bridge network (for example `pagila-demo-project_xxxxx_airflow`). Attach your database containers so the scheduler can resolve them by container name:
+
+**For Postgres target**:
+```bash
+# First, start Astro to create the network
+astro dev start
+
+# Discover the network name
+ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
+
+# Connect containers
+docker network connect $ASTRO_NETWORK pagila-pg-source
+docker network connect $ASTRO_NETWORK pagila-pg-target
+```
+
+**For SQL Server target**:
+```bash
+# First, start Astro to create the network
+astro dev start
+
+# Discover the network name
+ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
+
+# Connect containers
+docker network connect $ASTRO_NETWORK pagila-pg-source
+docker network connect $ASTRO_NETWORK pagila-mssql-target
+```
+
+> To discover the exact network name manually, run `docker network ls | grep astro`. If you prefer `docker compose`, you can wrap these services in a compose file as long as it joins the same Astro network.
 
 ## 4. Create Airflow Connections
-Use Airflow connections that point at the container hostnames on port 5432:
+
+### 4.1 Source Connection (Always Required)
+Create the Postgres source connection:
 
 ```bash
 astro dev run connections add pagila_postgres \
@@ -63,7 +108,12 @@ astro dev run connections add pagila_postgres \
   --conn-login pagila \
   --conn-password pagila_pw \
   --conn-schema pagila
+```
 
+### 4.2 Target Connection (Choose One)
+
+#### Option A: Postgres Target
+```bash
 astro dev run connections add pagila_tgt \
   --conn-type postgres \
   --conn-host pagila-pg-target \
@@ -73,9 +123,37 @@ astro dev run connections add pagila_tgt \
   --conn-schema pagila
 ```
 
-> On Docker Desktop you can still point at the mapped host ports by swapping `--conn-host` for `host.docker.internal` and using ports `5433`/`5444`.
+#### Option B: SQL Server Target
+```bash
+astro dev run connections add pagila_mssql \
+  --conn-type mssql \
+  --conn-host pagila-mssql-target \
+  --conn-port 1433 \
+  --conn-login sa \
+  --conn-password "PagilaPass123!" \
+  --conn-schema master
+```
+
+> **Important**: The SQL Server connection initially connects to the `master` database. The DAG will create and switch to the `pagila_target` database automatically.
+
+### 4.3 Additional Requirements for SQL Server
+
+If using SQL Server as the target, add these packages to `requirements.txt`:
+```
+apache-airflow-providers-microsoft-mssql
+pymssql
+```
+
+Then restart Astro:
+```bash
+astro dev restart
+```
+
+> On Docker Desktop you can still point at the mapped host ports by swapping `--conn-host` for `host.docker.internal` and using ports `5433` (Postgres source), `5444` (Postgres target), or `1433` (SQL Server target).
 
 ## 5. Place SQL Files
+
+### 5.1 Postgres Schema Files (Required for Source and Postgres Target)
 Place the Pagila SQL files in your Astro project at:
 ```
 include/pagila/schema.sql
@@ -89,6 +167,22 @@ Download the canonical files straight from GitHub:
 curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-schema.sql -o include/pagila/schema.sql
 curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-data.sql -o include/pagila/data.sql
 ```
+
+### 5.2 SQL Server Schema File (Required for SQL Server Target)
+If using SQL Server as the target, you also need the T-SQL schema file:
+```
+include/pagila/schema_mssql.sql
+```
+
+This file is included in the repository and contains the converted T-SQL schema with:
+- `INT IDENTITY(1,1)` instead of `SERIAL`/`BIGSERIAL`
+- `NVARCHAR` instead of `VARCHAR`/`TEXT`
+- `DATETIME2` instead of `TIMESTAMP`
+- `BIT` instead of `BOOLEAN`
+- `DECIMAL` instead of `NUMERIC`
+- Removed PostgreSQL-specific features (DOMAIN types, ENUM types, pl/pgsql functions)
+
+> The SQL Server schema is maintained separately because it uses different data types and syntax than PostgreSQL. See `MSSQL_MIGRATION.md` for detailed conversion notes.
 
 ## 6. Full DAG: Idempotent Pagila Loader (Source)
 
@@ -435,6 +529,8 @@ astro dev run dags trigger replicate_pagila_to_target
 ---
 
 ## 9. Verification & QA
+
+### 9.1 Postgres Target Verification
 ```bash
 # Row counts on target (examples)
 docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM actor;"
@@ -443,7 +539,38 @@ docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*
 # Audit ledger on source
 docker exec -it pagila-pg-source psql -U pagila -d pagila -c "SELECT loaded_at, schema_sha256, data_sha256, succeeded FROM pagila_support.pagila_load_audit ORDER BY loaded_at DESC LIMIT 5;"
 ```
-For a quick smoke test, counts on target should match source. The audit query confirms the loader recognized your latest schema + data hashes.
+
+### 9.2 SQL Server Target Verification
+```bash
+# Connect to SQL Server and check row counts
+docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'actor' AS table_name, COUNT(*) AS row_count FROM dbo.actor;"
+
+docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'rental' AS table_name, COUNT(*) AS row_count FROM dbo.rental;"
+
+# Comprehensive row count check (all tables)
+docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'language' AS t, COUNT(*) AS c FROM dbo.language UNION ALL SELECT 'actor', COUNT(*) FROM dbo.actor UNION ALL SELECT 'film', COUNT(*) FROM dbo.film UNION ALL SELECT 'rental', COUNT(*) FROM dbo.rental UNION ALL SELECT 'payment', COUNT(*) FROM dbo.payment;"
+```
+
+### Expected Row Counts (Both Targets)
+| Table | Rows |
+|-------|------|
+| language | 6 |
+| category | 16 |
+| actor | 200 |
+| film | 1,000 |
+| film_actor | 5,462 |
+| film_category | 1,000 |
+| country | 109 |
+| city | 600 |
+| address | 605 |
+| store | 2 |
+| customer | 599 |
+| staff | 2 |
+| inventory | 4,581 |
+| rental | 16,044 |
+| payment | 16,049 |
+
+For a quick smoke test, counts on target should match source. The audit query on source confirms the loader recognized your latest schema + data hashes.
 
 ---
 
@@ -464,9 +591,12 @@ For a quick smoke test, counts on target should match source. The audit query co
 │   └── replicate_pagila_to_target.py
 ├── include
 │   └── pagila
-│       ├── schema.sql
-│       └── data.sql
+│       ├── schema.sql          # Postgres schema (source + Postgres target)
+│       ├── data.sql            # Postgres data (source only)
+│       └── schema_mssql.sql    # SQL Server schema (SQL Server target only)
 ├── requirements.txt
+├── MSSQL_MIGRATION.md          # SQL Server migration guide
+├── AGENTS.md                   # Repository guidelines for contributors
 └── .env   (optional for AIRFLOW_CONN_... variables)
 ```
 
@@ -479,7 +609,181 @@ For a quick smoke test, counts on target should match source. The audit query co
 
 ---
 
-## 13. Contributor Notes
+## 13. SQL Server Target Configuration
+
+### 13.1 Overview
+The `replicate_pagila_to_target` DAG supports both **PostgreSQL** and **SQL Server** as target databases. The SQL Server implementation uses CSV-based bulk loading with memory-efficient streaming.
+
+### 13.2 Architecture Differences
+
+| Aspect | Postgres Target | SQL Server Target |
+|--------|----------------|-------------------|
+| **Hook** | `PostgresHook` | `MsSqlHook` |
+| **Connection ID** | `pagila_tgt` | `pagila_mssql` |
+| **Schema File** | `schema.sql` | `schema_mssql.sql` |
+| **Data Transfer** | `COPY TO/FROM` | CSV streaming + INSERT |
+| **Truncate** | `TRUNCATE TABLE` | `DELETE FROM` (FK compat) |
+| **Sequences** | `setval()` | `DBCC CHECKIDENT` |
+| **Autocommit** | `conn.autocommit = True` | `conn.autocommit(True)` |
+
+### 13.3 Data Flow (SQL Server)
+```
+1. Extract: Postgres COPY TO STDOUT (CSV format)
+   ↓
+2. Buffer: SpooledTemporaryFile (binary mode, 128MB cap)
+   ↓
+3. Transform: io.TextIOWrapper + Data Conversions
+   - Strip datetime timezone (+00, Z)
+   - Convert booleans (t/f → 1/0)
+   - Handle empty strings vs NULL
+   - Match columns to target schema
+   ↓
+4. Load: SQL Server batch INSERT (1000 rows/batch)
+   - Disable FK constraints
+   - Enable IDENTITY_INSERT (if needed)
+   - Batch insert data
+   - Re-enable FK constraints
+```
+
+### 13.4 Key Implementation Details
+
+**Database Creation**:
+- DAG connects to `master` database initially
+- Creates `pagila_target` database if it doesn't exist
+- Switches context using `USE pagila_target;` before operations
+
+**Schema Reset**:
+- Drops foreign key constraints first (SQL Server requirement)
+- Drops all tables in `dbo` schema
+- Recreates schema from `schema_mssql.sql`
+
+**Column Matching**:
+- Queries target schema to get actual columns (`INFORMATION_SCHEMA.COLUMNS`)
+- Only copies matching columns from source (handles schema differences)
+- Queries `IS_NULLABLE` to determine which columns accept NULL
+
+**Data Transformations**:
+- **Datetime**: Strip timezone info (`2022-01-15 10:00:00+00` → `2022-01-15 10:00:00`)
+- **Boolean**: Convert Postgres format (`t`/`f` → `1`/`0` for BIT columns)
+- **Empty Strings**: Keep as `""` for NOT NULL columns, convert to NULL for nullable columns
+- **IDENTITY_INSERT**: Query `sys.identity_columns`, only enable for tables with identity
+
+**Data Copy**:
+- Uses `DELETE FROM` instead of `TRUNCATE` (foreign key compatibility)
+- Disables FK constraints during load: `ALTER TABLE NOCHECK CONSTRAINT ALL`
+- Re-enables FK constraints after load: `ALTER TABLE CHECK CONSTRAINT ALL`
+- Batches INSERT statements (1000 rows per batch)
+- Uses `%s` placeholders (pymssql convention)
+
+**Identity Reseeding**:
+- Uses `DBCC CHECKIDENT` to reset auto-increment values
+- Ensures new rows continue from correct sequence
+
+### 13.5 Data Type Conversions
+
+The SQL Server schema (`schema_mssql.sql`) converts Postgres types:
+
+| Postgres Type | SQL Server Type | Notes |
+|--------------|----------------|-------|
+| `SERIAL` | `INT IDENTITY(1,1)` | Auto-increment |
+| `BIGSERIAL` | `BIGINT IDENTITY(1,1)` | Large auto-increment |
+| `TEXT` | `NVARCHAR(MAX)` | Variable length |
+| `VARCHAR(n)` | `NVARCHAR(n)` | Unicode support |
+| `TIMESTAMP` | `DATETIME2` | Timezone stripped |
+| `BOOLEAN` | `BIT` | Values converted |
+| `BYTEA` | `VARBINARY(MAX)` | Binary data |
+| `NUMERIC(p,s)` | `DECIMAL(p,s)` | Same semantics |
+
+**Removed Features**:
+- `fulltext` column (tsvector) - No direct SQL Server equivalent
+- DOMAIN types - Converted to base types
+- ENUM types - Converted to NVARCHAR with constraints
+- Postgres functions/triggers - Not needed for replication
+
+### 13.6 Switching Between Postgres and SQL Server
+
+To switch from Postgres to SQL Server target:
+
+1. **Start SQL Server container** (see Section 3.2, Option B)
+2. **Connect to Astro network** (see Section 3.3)
+3. **Create SQL Server connection** (see Section 4.2, Option B)
+4. **Update requirements.txt**:
+   ```
+   apache-airflow-providers-microsoft-mssql
+   pymssql
+   ```
+5. **Restart Astro**: `astro dev restart`
+6. **Modify DAG**: In `replicate_pagila_to_target.py`, change:
+   ```python
+   TGT_CONN_ID = "pagila_mssql"  # Change from "pagila_tgt"
+   ```
+7. **Trigger replication**: `astro dev run dags trigger replicate_pagila_to_target`
+
+To switch back to Postgres, reverse these changes.
+
+### 13.7 Troubleshooting SQL Server
+
+**Error: "Cannot insert explicit value for identity column when IDENTITY_INSERT is set to OFF"**
+- Solution: DAG now detects identity columns and enables IDENTITY_INSERT automatically
+- Verify you're running the latest version with this fix
+
+**Error: "Conversion failed when converting date and/or time from character string"**
+- Solution: DAG strips timezone info from Postgres timestamps (+00, Z)
+- Verify you're running the latest version with datetime conversion
+
+**Error: "Conversion failed when converting the nvarchar value 't' to data type bit"**
+- Solution: DAG converts Postgres boolean values (t/f → 1/0)
+- Verify you're running the latest version with boolean conversion
+
+**Error: "Cannot insert the value NULL into column 'phone'; column does not allow nulls"**
+- Solution: DAG queries IS_NULLABLE and handles empty strings correctly
+- Empty strings stay as "" for NOT NULL columns, convert to NULL for nullable
+
+**Error: "There are fewer columns in the INSERT statement than values"**
+- Solution: DAG queries target schema and only copies matching columns
+- Handles schema differences (e.g., fulltext column in Postgres but not SQL Server)
+
+**Error: "INSERT statement conflicted with FOREIGN KEY constraint"**
+- Solution: DAG disables FK constraints during load with NOCHECK CONSTRAINT ALL
+- Circular dependencies (store ↔ staff) are handled automatically
+
+**Error: "String or binary data would be truncated"**
+- Solution: Check `schema_mssql.sql` column sizes match your data
+- Example fix: `username NVARCHAR(16)` → `NVARCHAR(50)` for longer usernames
+
+**Error: "Cannot truncate table because it is being referenced by a FOREIGN KEY constraint"**
+- Solution: DAG uses `DELETE FROM` instead of `TRUNCATE`
+- Verify you're running the latest version with this fix
+
+**Error: "Incorrect syntax near 'GO'"**
+- Solution: `GO` statements are removed from `schema_mssql.sql`
+- If you manually edited the schema, remove all `GO` batch separators
+
+**Error: "object attribute 'autocommit' is read-only"**
+- Solution: DAG uses `conn.autocommit(True)` method call, not attribute assignment
+- Verify you're using the latest DAG code
+
+**Error: "Database 'pagila_target' does not exist"**
+- Solution: The DAG creates this database automatically
+- Ensure connection uses `master` schema (not `pagila_target`)
+
+**Error: "column 'last_update' does not exist" on payment table**
+- Solution: Postgres payment table is partitioned and doesn't have last_update
+- Ensure `schema_mssql.sql` payment table doesn't include last_update column
+
+**Performance: Large tables spilling to disk**
+- Solution: Increase `SPOOLED_MAX_MEMORY_BYTES` in the DAG
+- Default is 128MB; adjust based on worker memory capacity
+
+**Performance: Slow replication**
+- Solution: Increase batch size from 1000 to 5000 or 10000 rows
+- Monitor memory usage to avoid OOM errors
+
+For detailed migration notes and all 14 challenges solved, see `MSSQL_MIGRATION.md`.
+
+---
+
+## 14. Contributor Notes
 - The contributor guide lives in `AGENTS.md` and expands on project structure, coding style, testing commands, and pull-request expectations.
 - Run `astro dev pytest tests/dags` (requires Docker permissions) before opening a pull request; it covers DAG imports, tags, and retry policies.
 - If you add new DAGs, mirror the shared constants pattern (`DEFAULT_ARGS`, connection IDs, table lists) so that operators remain easy to audit and tests pass without modification.
