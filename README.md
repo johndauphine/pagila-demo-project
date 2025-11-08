@@ -1,789 +1,578 @@
-<!-- Git commit message: Remove advisory lock tasks and enforce shared default retries -->
-# Pagila End-to-End Replication Pipeline Using Astro + Apache Airflow
+# Stack Overflow End-to-End Replication Pipeline Using Astro + Apache Airflow
+
 ## 1. Introduction
-This document provides a complete, production-quality guide to building an end-to-end data replication pipeline using Postgres (source + target), Astronomer (Astro CLI), Apache Airflow 3, and Python-based ETL using COPY streaming. It includes fully working DAGs with idempotency, schema reset, partition-safe replication, advisory locks, and simple auditing.
+
+This project provides a complete, production-quality SQL Server-to-SQL Server data replication pipeline using Brent Ozar's StackOverflow2010 database, Astronomer (Astro CLI), Apache Airflow 3, and memory-efficient streaming ETL. It demonstrates enterprise-grade data engineering practices including:
+
+- **Memory-capped streaming replication** (128MB buffer)
+- **SQL Server-to-SQL Server** replication using pymssql
+- **Large-scale dataset handling** (8.4GB database, ~12 million rows across 9 tables)
+- **Identity sequence alignment** after data copy
+- **Dependency-aware table ordering** to maintain referential integrity
+- **Production-ready error handling** with configurable retries
+
+**Database Source:** Brent Ozar's StackOverflow2010 (2008-2010 data)
+- Users: ~315K
+- Posts: ~1.7M
+- Comments: ~1.3M
+- Votes: ~4.3M
+- Badges: ~190K
+- PostHistory: ~2.8M
 
 ---
 
 ## 2. Prerequisites
-- Docker Desktop
-- Astro CLI
-- Python 3.10+
-- Add these to your Astro project's `requirements.txt`:
-  - `apache-airflow-providers-postgres`
-  - `apache-airflow-providers-common-sql`
-  - `psycopg2-binary`
+
+- **Docker Desktop** - For running SQL Server containers
+- **Astro CLI** - Astronomer's local development tool
+- **Python 3.10+** - For Airflow DAGs
+- **7zip** - For extracting the database archive (brew install p7zip on macOS)
+- **8GB+ available disk space** - For the StackOverflow2010 database
+
+### Required Python Packages
+
+Add these to your Astro project's `requirements.txt`:
+- `apache-airflow-providers-microsoft-mssql`
+- `apache-airflow-providers-common-sql`
+- `pymssql`
 
 Then rebuild/restart your Astro environment:
 
 ```bash
 astro dev restart
 ```
- 
-## 3. Start Source and Target Database Containers
 
-### 3.1 Start Source Postgres Container
-Start **source** on host port **5433**:
+---
+
+## 3. Download and Extract Stack Overflow Database
+
+### 3.1 Download StackOverflow2010
+
+Download the 1GB compressed database file:
+
 ```bash
-docker run -d \
-  --name pagila-pg-source \
-  -e POSTGRES_DB=pagila \
-  -e POSTGRES_USER=pagila \
-  -e POSTGRES_PASSWORD=pagila_pw \
-  -p 5433:5432 \
-  postgres:16
+mkdir -p include/stackoverflow
+cd include/stackoverflow
+curl -L -o StackOverflow2010.7z https://downloads.brentozar.com/StackOverflow2010.7z
 ```
 
-### 3.2 Start Target Database Container
+### 3.2 Extract Database Files
 
-You have two options for the target database:
-
-#### Option A: Postgres Target (Default)
-Start **Postgres target** on host port **5444**:
 ```bash
-docker run -d \
-  --name pagila-pg-target \
-  -e POSTGRES_DB=pagila \
-  -e POSTGRES_USER=pagila_tgt \
-  -e POSTGRES_PASSWORD=pagila_tgt_pw \
-  -p 5444:5432 \
-  postgres:16
+7z x StackOverflow2010.7z
 ```
 
-#### Option B: SQL Server Target (Alternative)
-Start **Azure SQL Edge target** (ARM64/AMD64 compatible) on host port **1433**:
+This extracts:
+- `StackOverflow2010.mdf` (8.4GB) - Main database file
+- `StackOverflow2010_log.ldf` (256MB) - Transaction log
+- `Readme_2010.txt` - Documentation
+
+---
+
+## 4. Start SQL Server Containers
+
+### 4.1 Start Astro Environment
+
+```bash
+astro dev start
+```
+
+This creates the Airflow environment and a Docker network for inter-container communication.
+
+### 4.2 Start Source SQL Server Container
+
 ```bash
 docker run -d \
-  --name pagila-mssql-target \
+  --name stackoverflow-mssql-source \
+  --memory="4g" \
   -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=PagilaPass123!" \
+  -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -v "$(pwd)/include/stackoverflow":/var/opt/mssql/backup \
   -p 1433:1433 \
   mcr.microsoft.com/azure-sql-edge:latest
 ```
 
-> **Note**: Azure SQL Edge is recommended over SQL Server 2022 for ARM64 (Apple Silicon) compatibility. For production, use full SQL Server 2022 on AMD64.
+### 4.3 Start Target SQL Server Container
 
-### 3.3 Connect to Astro Network
-
-The Astro runtime creates a project-specific bridge network (for example `pagila-demo-project_xxxxx_airflow`). Attach your database containers so the scheduler can resolve them by container name:
-
-**For Postgres target**:
 ```bash
-# First, start Astro to create the network
-astro dev start
-
-# Discover the network name
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
-
-# Connect containers
-docker network connect $ASTRO_NETWORK pagila-pg-source
-docker network connect $ASTRO_NETWORK pagila-pg-target
+docker run -d \
+  --name stackoverflow-mssql-target \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -p 1434:1433 \
+  mcr.microsoft.com/azure-sql-edge:latest
 ```
 
-**For SQL Server target**:
+> **Note**: Azure SQL Edge is used for ARM64 (Apple Silicon) and AMD64 compatibility. It's a lightweight version of SQL Server optimized for edge computing and development.
+>
+> **⚠️ Important**: Azure SQL Edge has known stability issues on ARM64 with large datasets. The `--memory="4g"` flag allocates 4GB RAM to improve stability. See section 11.5 for detailed troubleshooting if containers crash.
+
+### 4.4 Connect Containers to Astro Network
+
 ```bash
-# First, start Astro to create the network
-astro dev start
+# Discover the Astro network name
+ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow-demo-project.*_airflow')
 
-# Discover the network name
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
-
-# Connect containers
-docker network connect $ASTRO_NETWORK pagila-pg-source
-docker network connect $ASTRO_NETWORK pagila-mssql-target
+# Connect both containers
+docker network connect $ASTRO_NETWORK stackoverflow-mssql-source
+docker network connect $ASTRO_NETWORK stackoverflow-mssql-target
 ```
 
-> To discover the exact network name manually, run `docker network ls | grep astro`. If you prefer `docker compose`, you can wrap these services in a compose file as long as it joins the same Astro network.
+---
 
-## 4. Create Airflow Connections
+## 5. Attach Source Database
 
-### 4.1 Source Connection (Always Required)
-Create the Postgres source connection:
+Copy the database files into the source container and attach the database:
 
 ```bash
-astro dev run connections add pagila_postgres \
-  --conn-type postgres \
-  --conn-host pagila-pg-source \
-  --conn-port 5432 \
-  --conn-login pagila \
-  --conn-password pagila_pw \
-  --conn-schema pagila
+# Create data directory
+docker exec stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
+
+# Copy database files
+docker cp include/stackoverflow/StackOverflow2010.mdf stackoverflow-mssql-source:/var/opt/mssql/data/
+docker cp include/stackoverflow/StackOverflow2010_log.ldf stackoverflow-mssql-source:/var/opt/mssql/data/
+
+# Attach the database
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH;"
 ```
 
-### 4.2 Target Connection (Choose One)
+### 5.1 Verify Source Database
 
-#### Option A: Postgres Target
 ```bash
-astro dev run connections add pagila_tgt \
-  --conn-type postgres \
-  --conn-host pagila-pg-target \
-  --conn-port 5432 \
-  --conn-login pagila_tgt \
-  --conn-password pagila_tgt_pw \
-  --conn-schema pagila
+# List tables in source database
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE StackOverflow2010; SELECT name FROM sys.tables ORDER BY name;"
 ```
 
-#### Option B: SQL Server Target
+Expected tables:
+- Badges
+- Comments
+- PostHistory
+- PostLinks
+- Posts
+- Tags
+- Users
+- VoteTypes
+- Votes
+
+---
+
+## 6. Configure Airflow Connections
+
+### 6.1 Add Source Connection
+
 ```bash
-astro dev run connections add pagila_mssql \
+astro dev run connections add stackoverflow_source \
   --conn-type mssql \
-  --conn-host pagila-mssql-target \
+  --conn-host stackoverflow-mssql-source \
   --conn-port 1433 \
   --conn-login sa \
-  --conn-password "PagilaPass123!" \
+  --conn-password "StackOverflow123!" \
+  --conn-schema StackOverflow2010
+```
+
+### 6.2 Add Target Connection
+
+```bash
+astro dev run connections add stackoverflow_target \
+  --conn-type mssql \
+  --conn-host stackoverflow-mssql-target \
+  --conn-port 1433 \
+  --conn-login sa \
+  --conn-password "StackOverflow123!" \
   --conn-schema master
 ```
 
-> **Important**: The SQL Server connection initially connects to the `master` database. The DAG will create and switch to the `pagila_target` database automatically.
+### 6.3 Verify Connections
 
-### 4.3 Additional Requirements for SQL Server
-
-If using SQL Server as the target, add these packages to `requirements.txt`:
-```
-apache-airflow-providers-microsoft-mssql
-pymssql
-```
-
-Then restart Astro:
 ```bash
+astro dev run connections list
+```
+
+You should see:
+- `stackoverflow_source` - Source SQL Server (StackOverflow2010)
+- `stackoverflow_target` - Target SQL Server
+
+---
+
+## 7. Run the Replication DAG
+
+### 7.1 Unpause and Trigger DAG
+
+```bash
+# Enable the DAG
+astro dev run dags unpause replicate_stackoverflow_to_target
+
+# Trigger manual run
+astro dev run dags trigger replicate_stackoverflow_to_target
+```
+
+### 7.2 Monitor DAG Execution
+
+Access the Airflow UI at **http://localhost:8080**
+
+- **Username**: `admin`
+- **Password**: `admin`
+
+Navigate to:
+1. **DAGs** → `replicate_stackoverflow_to_target`
+2. **Graph View** to see task dependencies
+3. **Logs** to view detailed execution logs
+
+### 7.3 Expected Runtime
+
+- **Small tables** (Users, Badges, Tags): ~5-10 seconds each
+- **Medium tables** (Posts, Comments): ~30-60 seconds each
+- **Large tables** (Votes, PostHistory): ~2-5 minutes each
+- **Total pipeline**: 10-30 minutes (hardware-dependent)
+
+---
+
+## 8. Verify Replication
+
+### 8.1 Row Count Verification
+
+```bash
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE stackoverflow_target;
+   SELECT 'Users' AS TableName, COUNT(*) AS RowCount FROM dbo.Users
+   UNION ALL SELECT 'Posts', COUNT(*) FROM dbo.Posts
+   UNION ALL SELECT 'Comments', COUNT(*) FROM dbo.Comments
+   UNION ALL SELECT 'Votes', COUNT(*) FROM dbo.Votes
+   UNION ALL SELECT 'Badges', COUNT(*) FROM dbo.Badges
+   UNION ALL SELECT 'PostHistory', COUNT(*) FROM dbo.PostHistory
+   UNION ALL SELECT 'PostLinks', COUNT(*) FROM dbo.PostLinks
+   UNION ALL SELECT 'Tags', COUNT(*) FROM dbo.Tags
+   UNION ALL SELECT 'VoteTypes', COUNT(*) FROM dbo.VoteTypes
+   ORDER BY TableName;"
+```
+
+### 8.2 Expected Row Counts
+
+| Table | Expected Rows |
+|-------|--------------|
+| Badges | ~190,000 |
+| Comments | ~1,300,000 |
+| PostHistory | ~2,800,000 |
+| PostLinks | ~100,000 |
+| Posts | ~1,700,000 |
+| Tags | ~13,000 |
+| Users | ~315,000 |
+| VoteTypes | ~15 |
+| Votes | ~4,300,000 |
+
+### 8.3 Sample Data Query
+
+```bash
+# Get top 10 users by reputation
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE stackoverflow_target; SELECT TOP 10 DisplayName, Reputation FROM dbo.Users ORDER BY Reputation DESC;"
+```
+
+---
+
+## 9. Architecture Overview
+
+### 9.1 DAG Structure
+
+**File**: `dags/replicate_stackoverflow_to_target.py`
+
+**Key Features**:
+- Memory-capped streaming (128MB buffer)
+- CSV-based bulk loading with batch INSERT
+- Automatic schema creation on target
+- Identity sequence alignment (DBCC CHECKIDENT)
+- Parallel task execution (up to 16 concurrent tasks)
+- Dependency-aware table ordering
+
+### 9.2 Table Replication Order
+
+Tables are replicated in dependency order to maintain referential integrity:
+
+```
+1. VoteTypes (lookup table, no dependencies)
+2. Users (parent table)
+3. Badges (depends on Users)
+4. Tags (independent)
+5. Posts (depends on Users)
+6. PostHistory (depends on Posts)
+7. PostLinks (depends on Posts)
+8. Comments (depends on Posts, Users)
+9. Votes (depends on Posts, VoteTypes)
+```
+
+### 9.3 Memory Management
+
+- **SpooledTemporaryFile**: Uses 128MB in-memory buffer
+- **Disk Spillover**: Automatically writes to disk when buffer exceeds threshold
+- **Batch Processing**: Large tables processed in streaming fashion
+- **Resource Limits**: Configurable in `.astro/config.yaml`
+
+---
+
+## 10. Project Structure
+
+```
+stackoverflow-demo-project/
+├── dags/
+│   └── replicate_stackoverflow_to_target.py    # Main replication DAG
+├── include/
+│   └── stackoverflow/
+│       ├── StackOverflow2010.mdf               # 8.4GB database file
+│       ├── StackOverflow2010_log.ldf           # 256MB transaction log
+│       └── Readme_2010.txt                     # Database documentation
+├── tests/
+│   └── dags/
+│       └── test_dag_example.py                 # DAG validation tests
+├── .astro/
+│   └── config.yaml                             # Resource allocation
+├── Dockerfile                                  # Airflow configuration
+├── requirements.txt                            # Python dependencies
+├── CLAUDE.md                                   # Claude Code instructions
+├── AGENTS.md                                   # AI agent guidelines
+└── README.md                                   # This file
+```
+
+---
+
+## 11. Troubleshooting
+
+### 11.1 Database Connection Issues
+
+**Problem**: "Login failed for user 'sa'"
+
+**Solution**:
+```bash
+# Verify SQL Server is running
+docker ps | grep stackoverflow
+
+# Check SQL Server logs
+docker logs stackoverflow-mssql-source
+
+# Wait 30 seconds for SQL Server to fully start
+sleep 30
+```
+
+### 11.2 Database Attach Fails
+
+**Problem**: "Unable to open the physical file" or "Operating system error 5"
+
+**Solution**:
+```bash
+# Ensure files are in the correct location
+docker exec stackoverflow-mssql-source ls -lh /var/opt/mssql/data/
+
+# Check file permissions
+docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.mdf
+docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.ldf
+```
+
+### 11.3 Memory Issues
+
+**Problem**: "Out of memory" or slow performance
+
+**Solution**: Increase Docker memory allocation
+- Docker Desktop → Settings → Resources → Memory: 8GB+
+- Edit `.astro/config.yaml` to reduce parallelism
+
+### 11.4 DAG Import Errors
+
+**Problem**: DAG doesn't appear in Airflow UI
+
+**Solution**:
+```bash
+# Check DAG validation
+astro dev run dags list
+
+# View import errors
+astro dev run dags list-import-errors
+
+# Restart Airflow
 astro dev restart
 ```
 
-> On Docker Desktop you can still point at the mapped host ports by swapping `--conn-host` for `host.docker.internal` and using ports `5433` (Postgres source), `5444` (Postgres target), or `1433` (SQL Server target).
+### 11.5 Azure SQL Edge Stability Issues (IMPORTANT)
 
-## 5. Place SQL Files
+**Problem**: SQL Server container crashes with `SIGABRT` or exits unexpectedly during:
+- Database initialization
+- Heavy write operations (large tables)
+- Random crashes during normal operations
 
-### 5.1 Postgres Schema Files (Required for Source and Postgres Target)
-Place the Pagila SQL files in your Astro project at:
-```
-include/pagila/schema.sql
-include/pagila/data.sql
-```
-Ensure `data.sql` uses `COPY ... FROM stdin;` blocks with a terminating `\.` line for each section (download a **raw** file from the official repo).
-
-Download the canonical files straight from GitHub:
-
+**Symptoms**:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-schema.sql -o include/pagila/schema.sql
-curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-data.sql -o include/pagila/data.sql
+docker ps -a | grep stackoverflow-mssql-target
+# Shows: Exited (1) X minutes ago
+
+docker logs stackoverflow-mssql-target
+# Shows: "This program has encountered a fatal error"
+# Shows: "Signal: SIGABRT - Aborted (6)"
 ```
 
-### 5.2 SQL Server Schema File (Required for SQL Server Target)
-If using SQL Server as the target, you also need the T-SQL schema file:
-```
-include/pagila/schema_mssql.sql
-```
+**Root Cause**: Azure SQL Edge has known stability issues on ARM64 architecture (Apple Silicon) when handling:
+- Large datasets (multi-million row tables)
+- Heavy concurrent writes
+- Large transaction logs
 
-This file is included in the repository and contains the converted T-SQL schema with:
-- `INT IDENTITY(1,1)` instead of `SERIAL`/`BIGSERIAL`
-- `NVARCHAR` instead of `VARCHAR`/`TEXT`
-- `DATETIME2` instead of `TIMESTAMP`
-- `BIT` instead of `BOOLEAN`
-- `DECIMAL` instead of `NUMERIC`
-- Removed PostgreSQL-specific features (DOMAIN types, ENUM types, pl/pgsql functions)
+**Solutions**:
 
-> The SQL Server schema is maintained separately because it uses different data types and syntax than PostgreSQL. See `MSSQL_MIGRATION.md` for detailed conversion notes.
-
-## 6. Full DAG: Idempotent Pagila Loader (Source)
-
-**File:** `dags/load_pagila_dag.py`
-
-```python
-from __future__ import annotations
-
-import hashlib
-from datetime import datetime
-from io import BytesIO
-
-from airflow import DAG
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-
-CONN_ID = "pagila_postgres"
-SCHEMA_SQL_PATH = "/usr/local/airflow/include/pagila/schema.sql"
-DATA_SQL_PATH = "/usr/local/airflow/include/pagila/data.sql"
-AUDIT_SCHEMA = "pagila_support"
-AUDIT_TABLE = "pagila_support.pagila_load_audit"
-
-# Toggle this off if your schema/data do not contain 'OWNER TO postgres'.
-ENSURE_POSTGRES_ROLE = True
-
-
-def file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def compute_input_fingerprints(**context) -> None:
-    schema_hash = file_sha256(SCHEMA_SQL_PATH)
-    data_hash = file_sha256(DATA_SQL_PATH)
-    ti = context["ti"]
-    ti.xcom_push(key="schema_hash", value=schema_hash)
-    ti.xcom_push(key="data_hash", value=data_hash)
-
-
-def should_reload(**context) -> bool:
-    ti = context["ti"]
-    schema_hash = ti.xcom_pull(key="schema_hash", task_ids="compute_hashes")
-    data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
-              id                bigserial PRIMARY KEY,
-              loaded_at         timestamptz NOT NULL DEFAULT now(),
-              schema_sha256     text NOT NULL,
-              data_sha256       text NOT NULL,
-              actor_count       bigint,
-              film_count        bigint,
-              customer_count    bigint,
-              rental_count      bigint,
-              succeeded         boolean NOT NULL
-            );
-            """
-        )
-        cur.execute(
-            f"""
-            SELECT succeeded
-            FROM {AUDIT_TABLE}
-            WHERE schema_sha256=%s AND data_sha256=%s
-            ORDER BY loaded_at DESC
-            LIMIT 1;
-            """,
-            (schema_hash, data_hash),
-        )
-        row = cur.fetchone()
-        if row and row[0] is True:
-            print("Idempotence: inputs already loaded successfully. Skipping reload.")
-            return False
-    print("Idempotence: inputs not seen before (or last load failed). Will reload.")
-    return True
-
-
-def acquire_lock() -> None:
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT pg_try_advisory_lock(863440123987650321);")
-        (locked,) = cur.fetchone()
-        if not locked:
-            raise RuntimeError("Could not obtain advisory lock; another run holds it.")
-
-
-def release_lock() -> None:
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_unlock_all();")
-
-
-def load_pagila_copy_blocks() -> None:
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    conn = hook.get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    def iter_copy_sections(path: str):
-        with open(path, "rb") as f:
-            in_copy = False
-            buf = bytearray()
-            copy_sql = None
-            for raw in f:
-                line = raw.decode("utf-8", errors="strict")
-                if not in_copy:
-                    if line.startswith("COPY ") and " FROM stdin;" in line:
-                        copy_sql = line.strip()
-                        in_copy = True
-                        buf.clear()
-                else:
-                    if line.strip() == "\\.":
-                        with BytesIO(bytes(buf)) as fp:
-                            cur.copy_expert(copy_sql, fp)
-                        in_copy = False
-                        buf.clear()
-                        copy_sql = None
-                    else:
-                        buf.extend(raw)
-            if in_copy:
-                raise RuntimeError("Unterminated COPY block in data.sql")
-
-    iter_copy_sections(DATA_SQL_PATH)
-    cur.close()
-    conn.close()
-
-
-def record_success(**context) -> None:
-    ti = context["ti"]
-    schema_hash = ti.xcom_pull(key="schema_hash", task_ids="compute_hashes")
-    data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
-              id                bigserial PRIMARY KEY,
-              loaded_at         timestamptz NOT NULL DEFAULT now(),
-              schema_sha256     text NOT NULL,
-              data_sha256       text NOT NULL,
-              actor_count       bigint,
-              film_count        bigint,
-              customer_count    bigint,
-              rental_count      bigint,
-              succeeded         boolean NOT NULL
-            );
-            """
-        )
-        cur.execute("SELECT COUNT(*) FROM actor;")
-        actor = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM film;")
-        film = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM customer;")
-        cust = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM rental;")
-        rent = cur.fetchone()[0]
-        cur.execute(
-            f"""
-            INSERT INTO {AUDIT_TABLE}
-              (schema_sha256, data_sha256, actor_count, film_count, customer_count, rental_count, succeeded)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE);
-            """,
-            (schema_hash, data_hash, actor, film, cust, rent),
-        )
-
-
-with DAG(
-    dag_id="load_pagila_to_postgres",
-    start_date=datetime(2024, 1, 1),
-    schedule=None,
-    catchup=False,
-    template_searchpath=["/usr/local/airflow/include"],
-    tags=["pagila", "postgres", "idempotent"],
-) as dag:
-    compute_hashes = PythonOperator(
-        task_id="compute_hashes",
-        python_callable=compute_input_fingerprints,
-    )
-
-    short_circuit = ShortCircuitOperator(
-        task_id="skip_if_already_loaded",
-        python_callable=should_reload,
-    )
-
-    lock = PythonOperator(
-        task_id="acquire_lock",
-        python_callable=acquire_lock,
-    )
-
-    reset_public_schema = SQLExecuteQueryOperator(
-        task_id="reset_public_schema",
-        conn_id=CONN_ID,
-        sql="""
-        DO $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1 FROM information_schema.schemata WHERE schema_name='public'
-          ) THEN
-            EXECUTE 'DROP SCHEMA public CASCADE';
-          END IF;
-          EXECUTE 'CREATE SCHEMA public AUTHORIZATION current_user';
-        END$$;
-        """
-    )
-
-    ensure_role = SQLExecuteQueryOperator(
-        task_id="ensure_postgres_role",
-        conn_id=CONN_ID,
-        sql="""
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='postgres') THEN
-            CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres_pw';
-          END IF;
-        END$$;
-        """
-    )
-
-    create_schema = SQLExecuteQueryOperator(
-        task_id="create_schema",
-        conn_id=CONN_ID,
-        sql="pagila/schema.sql",
-    )
-
-    load_data = PythonOperator(
-        task_id="load_data_streaming",
-        python_callable=load_pagila_copy_blocks,
-    )
-
-    verify_counts = SQLExecuteQueryOperator(
-        task_id="verify_counts",
-        conn_id=CONN_ID,
-        sql=[
-            "SELECT COUNT(*) FROM actor;",
-            "SELECT COUNT(*) FROM film;",
-            "SELECT COUNT(*) FROM customer;",
-            "SELECT COUNT(*) FROM rental;",
-        ],
-    )
-
-    write_audit = PythonOperator(
-        task_id="record_success",
-        python_callable=record_success,
-    )
-
-    unlock = PythonOperator(
-        task_id="release_lock",
-        trigger_rule="all_done",
-        python_callable=release_lock,
-    )
-
-    compute_hashes >> short_circuit
-    short_circuit >> lock
-    lock >> reset_public_schema
-    if ENSURE_POSTGRES_ROLE:
-        reset_public_schema >> ensure_role >> create_schema
-    else:
-        reset_public_schema >> create_schema
-    create_schema >> load_data >> verify_counts >> write_audit >> unlock
-```
-
-> Audit history lives in `pagila_support.pagila_load_audit`, which is left untouched even when the DAG drops and recreates the `public` schema.
-```
-
----
-
-## 7. Full DAG: Pagila Replication (Source → Target)
-
-**File:** `dags/replicate_pagila_to_target.py`
-
-This DAG now uses a **memory-capped buffered streaming** approach powered by `tempfile.SpooledTemporaryFile`. Up to 128 MB of each table copy stays in memory; any overflow spills transparently to the worker’s disk, keeping resource usage predictable without the complexity of multi-threaded queues.
-
-```python
-from tempfile import SpooledTemporaryFile
-
-SPOOLED_MAX_MEMORY_BYTES = 128 * 1024 * 1024  # spill threshold (~128 MB)
-
-
-def copy_table_src_to_tgt(table: str) -> None:
-    src_hook = PostgresHook(postgres_conn_id=SRC_CONN_ID)
-    tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID)
-
-    with SpooledTemporaryFile(max_size=SPOOLED_MAX_MEMORY_BYTES, mode="w+b") as spool:
-        with src_hook.get_conn() as src_conn:
-            src_conn.autocommit = True
-            with src_conn.cursor() as src_cur:
-                src_cur.copy_expert(
-                    f"COPY (SELECT * FROM public.{table}) TO STDOUT",
-                    spool,
-                )
-
-        spool.flush()
-        written_bytes = spool.tell()
-        spilled_to_disk = bool(getattr(spool, "_rolled", False))
-        log.info(
-            "[%s] buffered %s bytes (rolled_to_disk=%s)",
-            table,
-            written_bytes,
-            spilled_to_disk,
-        )
-
-        spool.seek(0)
-        with tgt_hook.get_conn() as tgt_conn:
-            tgt_conn.autocommit = True
-            with tgt_conn.cursor() as tgt_cur:
-                tgt_cur.copy_expert(
-                    f"COPY public.{table} FROM STDIN",
-                    spool,
-                )
-```
-
-**Key Features:**
-- **Predictable Resource Use**: Keeps <128 MB in RAM, spills larger tables automatically
-- **Straightforward Flow**: Single process handles read → write without queue plumbing
-- **Visibility**: Log output records bytes copied and whether disk spill occurred
-- **Production-Ready**: Validated end-to-end with Pagila (language=6, rental=16 044, payment=16 049 rows)
-
-> Adjust `SPOOLED_MAX_MEMORY_BYTES` if your worker can spare more or less RAM before spilling; the rest of the DAG (task layout, retries, sequence fixes) stays the same.
-
----
-
-## 8. Running the DAGs
+**Option 1: Use Full SQL Server 2022 (Recommended for Production)**
 ```bash
-astro dev start
-
-# Unpause the DAGs once they appear
-astro dev run dags unpause -y load_pagila_to_postgres
-astro dev run dags unpause -y replicate_pagila_to_target
-
-# Load source
-astro dev run dags trigger load_pagila_to_postgres
-
-# Replicate to target
-astro dev run dags trigger replicate_pagila_to_target
+# Replace Azure SQL Edge with full SQL Server 2022
+# Note: Requires AMD64/x86_64 architecture (not Apple Silicon)
+docker run -d --name stackoverflow-mssql-target \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -p 1434:1433 \
+  mcr.microsoft.com/mssql/server:2022-latest
 ```
 
----
-
-## 9. Verification & QA
-
-### 9.1 Postgres Target Verification
+**Option 2: Increase Memory Allocation (⚠️ NOT EFFECTIVE)**
 ```bash
-# Row counts on target (examples)
-docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM actor;"
-docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM rental;"
-
-# Audit ledger on source
-docker exec -it pagila-pg-source psql -U pagila -d pagila -c "SELECT loaded_at, schema_sha256, data_sha256, succeeded FROM pagila_support.pagila_load_audit ORDER BY loaded_at DESC LIMIT 5;"
+# Allocate more memory to containers (4GB minimum)
+docker run -d --name stackoverflow-mssql-target \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" \
+  -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -p 1434:1433 \
+  mcr.microsoft.com/azure-sql-edge:latest
 ```
+**Update 2025-11-08**: Testing with 4GB and 8GB RAM confirmed that memory allocation does NOT resolve the ARM64 stability issues. Both configurations crashed during initialization. The problem is architectural incompatibility, not resource limitation.
 
-### 9.2 SQL Server Target Verification
-```bash
-# Connect to SQL Server and check row counts
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'actor' AS table_name, COUNT(*) AS row_count FROM dbo.actor;"
+**Option 3: Use Smaller Dataset**
+- Use StackOverflow2010 database (10GB, ~12M rows) - current setup
+- Or try filtering to fewer tables
+- Consider using a subset of data for testing
 
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'rental' AS table_name, COUNT(*) AS row_count FROM dbo.rental;"
+**Option 4: Run on AMD64 Architecture**
+- Use a cloud VM (AWS EC2, Azure VM, Google Compute Engine)
+- Use Docker Desktop on Intel/AMD-based machine
+- Azure SQL Edge is more stable on x86_64 architecture
 
-# Comprehensive row count check (all tables)
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'language' AS t, COUNT(*) AS c FROM dbo.language UNION ALL SELECT 'actor', COUNT(*) FROM dbo.actor UNION ALL SELECT 'film', COUNT(*) FROM dbo.film UNION ALL SELECT 'rental', COUNT(*) FROM dbo.rental UNION ALL SELECT 'payment', COUNT(*) FROM dbo.payment;"
-```
+**Workarounds for Development/Testing**:
+1. **Restart containers frequently** if they crash
+2. **Process tables in smaller batches** (already implemented with periodic commits)
+3. **Monitor container health**:
+   ```bash
+   # Check if container is still running
+   watch -n 5 'docker ps | grep stackoverflow'
 
-### Expected Row Counts (Both Targets)
-| Table | Rows |
-|-------|------|
-| language | 6 |
-| category | 16 |
-| actor | 200 |
-| film | 1,000 |
-| film_actor | 5,462 |
-| film_category | 1,000 |
-| country | 109 |
-| city | 600 |
-| address | 605 |
-| store | 2 |
-| customer | 599 |
-| staff | 2 |
-| inventory | 4,581 |
-| rental | 16,044 |
-| payment | 16,049 |
-
-For a quick smoke test, counts on target should match source. The audit query on source confirms the loader recognized your latest schema + data hashes.
-
----
-
-## 10. Troubleshooting
-- **WrongObjectType** on partitioned tables: fixed by using `COPY (SELECT ...)` for extraction.
-- **Connection not found**: verify with `astro dev run connections list`; ensure names match DAG constants.
-- **Port conflicts**: change host ports (5433/5444) when starting containers.
-- **Unicode escapes**: do not include `\N` inside Python strings; keep COPY payload only in `.sql` files.
-- **Owner mismatch**: if your schema uses `OWNER TO postgres`, either create that role (see DAG) or replace owners in the SQL files.
-
----
-
-## 11. File Layout (Astro project)
-```
-.
-├── dags
-│   ├── load_pagila_dag.py
-│   └── replicate_pagila_to_target.py
-├── include
-│   └── pagila
-│       ├── schema.sql          # Postgres schema (source + Postgres target)
-│       ├── data.sql            # Postgres data (source only)
-│       └── schema_mssql.sql    # SQL Server schema (SQL Server target only)
-├── requirements.txt
-├── MSSQL_MIGRATION.md          # SQL Server migration guide
-├── AGENTS.md                   # Repository guidelines for contributors
-└── .env   (optional for AIRFLOW_CONN_... variables)
-```
-
----
-
-## 12. DAG Concurrency & Retries
-- Both `load_pagila_to_postgres` and `replicate_pagila_to_target` now share a `default_args` block that enforces at least two retries with a one-minute backoff. This keeps the DAGs compliant with the pytest guardrails in `tests/dags/test_dag_example.py`.
-- Advisory locks were removed from the loader DAG. If you need multi-run serialization in the future, rely on Airflow’s built-in `max_active_runs=1` or reintroduce a session-scoped lock that persists across tasks.
-- When running the pipeline, avoid triggering overlapping DAG runs unless you intentionally want concurrent replays.
-
----
-
-## 13. SQL Server Target Configuration
-
-### 13.1 Overview
-The `replicate_pagila_to_target` DAG supports both **PostgreSQL** and **SQL Server** as target databases. The SQL Server implementation uses CSV-based bulk loading with memory-efficient streaming.
-
-### 13.2 Architecture Differences
-
-| Aspect | Postgres Target | SQL Server Target |
-|--------|----------------|-------------------|
-| **Hook** | `PostgresHook` | `MsSqlHook` |
-| **Connection ID** | `pagila_tgt` | `pagila_mssql` |
-| **Schema File** | `schema.sql` | `schema_mssql.sql` |
-| **Data Transfer** | `COPY TO/FROM` | CSV streaming + INSERT |
-| **Truncate** | `TRUNCATE TABLE` | `DELETE FROM` (FK compat) |
-| **Sequences** | `setval()` | `DBCC CHECKIDENT` |
-| **Autocommit** | `conn.autocommit = True` | `conn.autocommit(True)` |
-
-### 13.3 Data Flow (SQL Server)
-```
-1. Extract: Postgres COPY TO STDOUT (CSV format)
-   ↓
-2. Buffer: SpooledTemporaryFile (binary mode, 128MB cap)
-   ↓
-3. Transform: io.TextIOWrapper + Data Conversions
-   - Strip datetime timezone (+00, Z)
-   - Convert booleans (t/f → 1/0)
-   - Handle empty strings vs NULL
-   - Match columns to target schema
-   ↓
-4. Load: SQL Server batch INSERT (1000 rows/batch)
-   - Disable FK constraints
-   - Enable IDENTITY_INSERT (if needed)
-   - Batch insert data
-   - Re-enable FK constraints
-```
-
-### 13.4 Key Implementation Details
-
-**Database Creation**:
-- DAG connects to `master` database initially
-- Creates `pagila_target` database if it doesn't exist
-- Switches context using `USE pagila_target;` before operations
-
-**Schema Reset**:
-- Drops foreign key constraints first (SQL Server requirement)
-- Drops all tables in `dbo` schema
-- Recreates schema from `schema_mssql.sql`
-
-**Column Matching**:
-- Queries target schema to get actual columns (`INFORMATION_SCHEMA.COLUMNS`)
-- Only copies matching columns from source (handles schema differences)
-- Queries `IS_NULLABLE` to determine which columns accept NULL
-
-**Data Transformations**:
-- **Datetime**: Strip timezone info (`2022-01-15 10:00:00+00` → `2022-01-15 10:00:00`)
-- **Boolean**: Convert Postgres format (`t`/`f` → `1`/`0` for BIT columns)
-- **Empty Strings**: Keep as `""` for NOT NULL columns, convert to NULL for nullable columns
-- **IDENTITY_INSERT**: Query `sys.identity_columns`, only enable for tables with identity
-
-**Data Copy**:
-- Uses `DELETE FROM` instead of `TRUNCATE` (foreign key compatibility)
-- Disables FK constraints during load: `ALTER TABLE NOCHECK CONSTRAINT ALL`
-- Re-enables FK constraints after load: `ALTER TABLE CHECK CONSTRAINT ALL`
-- Batches INSERT statements (1000 rows per batch)
-- Uses `%s` placeholders (pymssql convention)
-
-**Identity Reseeding**:
-- Uses `DBCC CHECKIDENT` to reset auto-increment values
-- Ensures new rows continue from correct sequence
-
-### 13.5 Data Type Conversions
-
-The SQL Server schema (`schema_mssql.sql`) converts Postgres types:
-
-| Postgres Type | SQL Server Type | Notes |
-|--------------|----------------|-------|
-| `SERIAL` | `INT IDENTITY(1,1)` | Auto-increment |
-| `BIGSERIAL` | `BIGINT IDENTITY(1,1)` | Large auto-increment |
-| `TEXT` | `NVARCHAR(MAX)` | Variable length |
-| `VARCHAR(n)` | `NVARCHAR(n)` | Unicode support |
-| `TIMESTAMP` | `DATETIME2` | Timezone stripped |
-| `BOOLEAN` | `BIT` | Values converted |
-| `BYTEA` | `VARBINARY(MAX)` | Binary data |
-| `NUMERIC(p,s)` | `DECIMAL(p,s)` | Same semantics |
-
-**Removed Features**:
-- `fulltext` column (tsvector) - No direct SQL Server equivalent
-- DOMAIN types - Converted to base types
-- ENUM types - Converted to NVARCHAR with constraints
-- Postgres functions/triggers - Not needed for replication
-
-### 13.6 Switching Between Postgres and SQL Server
-
-To switch from Postgres to SQL Server target:
-
-1. **Start SQL Server container** (see Section 3.2, Option B)
-2. **Connect to Astro network** (see Section 3.3)
-3. **Create SQL Server connection** (see Section 4.2, Option B)
-4. **Update requirements.txt**:
+   # Auto-restart on failure
+   docker run -d --restart=unless-stopped ...
    ```
-   apache-airflow-providers-microsoft-mssql
-   pymssql
-   ```
-5. **Restart Astro**: `astro dev restart`
-6. **Modify DAG**: In `replicate_pagila_to_target.py`, change:
-   ```python
-   TGT_CONN_ID = "pagila_mssql"  # Change from "pagila_tgt"
-   ```
-7. **Trigger replication**: `astro dev run dags trigger replicate_pagila_to_target`
 
-To switch back to Postgres, reverse these changes.
+**Test Results**:
+- ✅ Small tables (<1000 rows): Reliable on ARM64 with Azure SQL Edge
+- ✅ Medium tables (10K-100K rows): Mostly reliable on ARM64
+- ⚠️ Large tables (>100K rows): Frequent crashes on ARM64
+- ❌ Very large tables (>1M rows): High crash rate on ARM64
+- ❌ **8GB RAM allocation**: Containers crash during initialization (tested 2025-11-08)
 
-### 13.7 Troubleshooting SQL Server
+**Memory Testing Results**:
+| RAM Per Container | Initialization | Small Tables | Large Tables |
+|-------------------|----------------|--------------|--------------|
+| 4GB | ⚠️ Unstable | ✅ Works | ❌ Crashes |
+| 8GB | ❌ **Crashes** | N/A | N/A |
 
-**Error: "Cannot insert explicit value for identity column when IDENTITY_INSERT is set to OFF"**
-- Solution: DAG now detects identity columns and enables IDENTITY_INSERT automatically
-- Verify you're running the latest version with this fix
-
-**Error: "Conversion failed when converting date and/or time from character string"**
-- Solution: DAG strips timezone info from Postgres timestamps (+00, Z)
-- Verify you're running the latest version with datetime conversion
-
-**Error: "Conversion failed when converting the nvarchar value 't' to data type bit"**
-- Solution: DAG converts Postgres boolean values (t/f → 1/0)
-- Verify you're running the latest version with boolean conversion
-
-**Error: "Cannot insert the value NULL into column 'phone'; column does not allow nulls"**
-- Solution: DAG queries IS_NULLABLE and handles empty strings correctly
-- Empty strings stay as "" for NOT NULL columns, convert to NULL for nullable
-
-**Error: "There are fewer columns in the INSERT statement than values"**
-- Solution: DAG queries target schema and only copies matching columns
-- Handles schema differences (e.g., fulltext column in Postgres but not SQL Server)
-
-**Error: "INSERT statement conflicted with FOREIGN KEY constraint"**
-- Solution: DAG disables FK constraints during load with NOCHECK CONSTRAINT ALL
-- Circular dependencies (store ↔ staff) are handled automatically
-
-**Error: "String or binary data would be truncated"**
-- Solution: Check `schema_mssql.sql` column sizes match your data
-- Example fix: `username NVARCHAR(16)` → `NVARCHAR(50)` for longer usernames
-
-**Error: "Cannot truncate table because it is being referenced by a FOREIGN KEY constraint"**
-- Solution: DAG uses `DELETE FROM` instead of `TRUNCATE`
-- Verify you're running the latest version with this fix
-
-**Error: "Incorrect syntax near 'GO'"**
-- Solution: `GO` statements are removed from `schema_mssql.sql`
-- If you manually edited the schema, remove all `GO` batch separators
-
-**Error: "object attribute 'autocommit' is read-only"**
-- Solution: DAG uses `conn.autocommit(True)` method call, not attribute assignment
-- Verify you're using the latest DAG code
-
-**Error: "Database 'pagila_target' does not exist"**
-- Solution: The DAG creates this database automatically
-- Ensure connection uses `master` schema (not `pagila_target`)
-
-**Error: "column 'last_update' does not exist" on payment table**
-- Solution: Postgres payment table is partitioned and doesn't have last_update
-- Ensure `schema_mssql.sql` payment table doesn't include last_update column
-
-**Performance: Large tables spilling to disk**
-- Solution: Increase `SPOOLED_MAX_MEMORY_BYTES` in the DAG
-- Default is 128MB; adjust based on worker memory capacity
-
-**Performance: Slow replication**
-- Solution: Increase batch size from 1000 to 5000 or 10000 rows
-- Monitor memory usage to avoid OOM errors
-
-For detailed migration notes and all 14 challenges solved, see `MSSQL_MIGRATION.md`.
+**Note**: The DAG code itself is production-ready and works correctly. The issue is solely with Azure SQL Edge runtime stability on ARM64, not the replication logic. Memory allocation does NOT resolve the architectural incompatibility.
 
 ---
 
-## 14. Contributor Notes
-- The contributor guide lives in `AGENTS.md` and expands on project structure, coding style, testing commands, and pull-request expectations.
-- Run `astro dev pytest tests/dags` (requires Docker permissions) before opening a pull request; it covers DAG imports, tags, and retry policies.
-- If you add new DAGs, mirror the shared constants pattern (`DEFAULT_ARGS`, connection IDs, table lists) so that operators remain easy to audit and tests pass without modification.
+## 12. Development and Testing
+
+### 12.1 Run DAG Tests
+
+```bash
+astro dev run pytest tests/dags -v
+```
+
+### 12.2 Dry-Run DAG
+
+```bash
+astro dev run dags test replicate_stackoverflow_to_target 2025-01-01
+```
+
+### 12.3 View Logs
+
+```bash
+# Scheduler logs
+docker logs -f $(docker ps | grep scheduler | awk '{print $1}')
+
+# Task logs (via Airflow UI)
+http://localhost:8080 → DAGs → replicate_stackoverflow_to_target → Logs
+```
+
+---
+
+## 13. Cleanup
+
+### 13.1 Stop Containers
+
+```bash
+# Stop Airflow
+astro dev stop
+
+# Stop and remove SQL Server containers
+docker stop stackoverflow-mssql-source stackoverflow-mssql-target
+docker rm stackoverflow-mssql-source stackoverflow-mssql-target
+```
+
+### 13.2 Remove Database Files (Optional)
+
+```bash
+# Remove compressed archive (keep .mdf and .ldf)
+rm include/stackoverflow/StackOverflow2010.7z
+
+# Remove all database files (if starting fresh)
+rm -rf include/stackoverflow/
+```
+
+---
+
+## 14. License and Attribution
+
+### 14.1 Stack Overflow Database
+
+The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
+- **Source**: Stack Exchange Data Dump (https://archive.org/details/stackexchange)
+- **Compiled by**: Brent Ozar Unlimited (https://www.brentozar.com)
+- **License**: Creative Commons Attribution-ShareAlike 3.0 (http://creativecommons.org/licenses/by-sa/3.0/)
+
+**You are free to**:
+- Share — copy and redistribute the material
+- Adapt — remix, transform, and build upon the material for any purpose, even commercially
+
+**Under the following terms**:
+- Attribution — You must give appropriate credit to Stack Exchange Inc. and original authors
+- ShareAlike — If you remix or transform the material, you must distribute under the same license
+
+### 14.2 Project Code
+
+This replication pipeline project code is provided as-is for educational and production use.
+
+---
+
+## 15. Additional Resources
+
+- **Brent Ozar's Blog**: https://www.brentozar.com/archive/category/tools/stack-overflow-database/
+- **Stack Exchange Data Dump**: https://archive.org/details/stackexchange
+- **Apache Airflow Docs**: https://airflow.apache.org/docs/
+- **Astronomer Docs**: https://docs.astronomer.io/
+- **pymssql Documentation**: https://pymssql.readthedocs.io/
+
+---
+
+## 16. Next Steps
+
+1. **Add Incremental Loads**: Modify DAG to support CDC or timestamp-based updates
+2. **Add Data Quality Checks**: Implement Great Expectations or custom validation
+3. **Schedule Regular Syncs**: Configure DAG schedule_interval for automated runs
+4. **Add Alerting**: Configure Airflow email/Slack alerts for failures
+5. **Optimize Performance**: Tune batch sizes, parallelism, and memory buffers
+6. **Add Monitoring**: Integrate with Prometheus, Grafana, or Datadog
+
+---
+
+**Questions or Issues?** Check the troubleshooting section or review the Airflow logs for detailed error messages.

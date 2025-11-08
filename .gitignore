@@ -9,3 +9,9 @@ airflow-webserver.pid
 webserver_config.py
 airflow.cfg
 airflow.db
+
+# Large database files
+*.mdf
+*.ldf
+*.7z
+*.bak

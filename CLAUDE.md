@@ -2,6 +2,37 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ IMPORTANT: Azure SQL Edge Stability Warning
+
+**Azure SQL Edge has known stability issues on ARM64 (Apple Silicon) architecture:**
+- Container may crash during database initialization or heavy writes
+- Symptoms: Container exits with code 1, `SIGABRT` errors in logs
+- Affects: Large table replication (>100K rows), especially Users, Posts, Votes tables
+- **Tested 2025-11-08**: Even 8GB RAM allocation does NOT prevent initialization crashes
+
+**Recommendations:**
+1. **Production**: Use full SQL Server 2022 on AMD64/x86_64 architecture (REQUIRED)
+2. **Development on ARM64**: ⚠️ NOT RECOMMENDED - crashes even with 8GB RAM
+3. **Alternative**: Test on cloud VM (AWS, Azure, GCP) with AMD64 architecture
+
+**Memory Testing Results:**
+- 4GB RAM: Unstable, crashes during heavy operations
+- 8GB RAM: Crashes during initialization (before any data operations)
+- **Conclusion**: Issue is architectural incompatibility, NOT memory limitation
+
+**If you must test on ARM64:**
+```bash
+docker run -d --name stackoverflow-mssql-target \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -p 1434:1433 mcr.microsoft.com/azure-sql-edge:latest
+```
+Expect frequent crashes. Restart containers as needed.
+
+See README.md section 11.5 for detailed troubleshooting.
+
+---
+
 ## Quick Start: Complete Environment Setup
 
 ### Step 1: Start Astro
@@ -9,101 +40,105 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 astro dev start
 ```
 
-### Step 2: Set Up Databases
+### Step 2: Set Up SQL Server Databases
 
-**Choose your target database type (Postgres OR SQL Server):**
+**SQL Server-to-SQL Server Replication Pipeline:**
 
-#### Option A: PostgreSQL Target (Simpler)
 ```bash
-# Start Postgres source
-docker run -d --name pagila-pg-source \
-  -e POSTGRES_DB=pagila -e POSTGRES_USER=pagila -e POSTGRES_PASSWORD=pagila_pw \
-  -p 5433:5432 postgres:16
-
-# Start Postgres target
-docker run -d --name pagila-pg-target \
-  -e POSTGRES_DB=pagila -e POSTGRES_USER=pagila_tgt -e POSTGRES_PASSWORD=pagila_tgt_pw \
-  -p 5444:5432 postgres:16
-
-# Connect to Astro network
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
-docker network connect $ASTRO_NETWORK pagila-pg-source
-docker network connect $ASTRO_NETWORK pagila-pg-target
-```
-
-#### Option B: SQL Server Target (Cross-Database Replication)
-```bash
-# Start Postgres source
-docker run -d --name pagila-pg-source \
-  -e POSTGRES_DB=pagila -e POSTGRES_USER=pagila -e POSTGRES_PASSWORD=pagila_pw \
-  -p 5433:5432 postgres:16
-
-# Start SQL Server target (Azure SQL Edge for ARM64 compatibility)
-docker run -d --name pagila-mssql-target \
-  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=PagilaPass123!" \
+# Start SQL Server source with StackOverflow2010 database
+# Note: The .mdf and .ldf files are in include/stackoverflow/
+# Allocate 4GB RAM for stability (especially important on ARM64)
+docker run -d --name stackoverflow-mssql-source \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -v "$(pwd)/include/stackoverflow":/var/opt/mssql/backup \
   -p 1433:1433 mcr.microsoft.com/azure-sql-edge:latest
 
+# Start SQL Server target (4GB RAM for heavy write operations)
+docker run -d --name stackoverflow-mssql-target \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -p 1434:1433 mcr.microsoft.com/azure-sql-edge:latest
+
 # Connect to Astro network
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
-docker network connect $ASTRO_NETWORK pagila-pg-source
-docker network connect $ASTRO_NETWORK pagila-mssql-target
+ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow-demo-project.*_airflow')
+docker network connect $ASTRO_NETWORK stackoverflow-mssql-source
+docker network connect $ASTRO_NETWORK stackoverflow-mssql-target
 ```
 
-### Step 3: Create Airflow Connections
+### Step 3: Attach Source Database
 
-**Source connection (always required):**
 ```bash
-astro dev run connections add pagila_postgres \
-  --conn-type postgres --conn-host pagila-pg-source --conn-port 5432 \
-  --conn-login pagila --conn-password pagila_pw --conn-schema pagila
+# Copy database files into source container and attach
+docker exec -it stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
+docker cp include/stackoverflow/StackOverflow2010.mdf stackoverflow-mssql-source:/var/opt/mssql/data/
+docker cp include/stackoverflow/StackOverflow2010_log.ldf stackoverflow-mssql-source:/var/opt/mssql/data/
+
+# Attach the database
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH;"
 ```
 
-**Target connection (choose based on Step 2):**
+### Step 4: Create Airflow Connections
+
 ```bash
-# For Postgres target
-astro dev run connections add pagila_tgt \
-  --conn-type postgres --conn-host pagila-pg-target --conn-port 5432 \
-  --conn-login pagila_tgt --conn-password pagila_tgt_pw --conn-schema pagila
+# Source connection
+astro dev run connections add stackoverflow_source \
+  --conn-type mssql --conn-host stackoverflow-mssql-source --conn-port 1433 \
+  --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
 
-# OR for SQL Server target
-astro dev run connections add pagila_mssql \
-  --conn-type mssql --conn-host pagila-mssql-target --conn-port 1433 \
-  --conn-login sa --conn-password "PagilaPass123!" --conn-schema master
+# Target connection
+astro dev run connections add stackoverflow_target \
+  --conn-type mssql --conn-host stackoverflow-mssql-target --conn-port 1433 \
+  --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
 ```
 
-### Step 4: Run DAGs
+### Step 5: Run DAGs
+
 ```bash
-# Load source data
-astro dev run dags unpause load_pagila_to_postgres
-astro dev run dags trigger load_pagila_to_postgres
-
-# Wait for source load to complete, then replicate to target
-astro dev run dags unpause replicate_pagila_to_target
-astro dev run dags trigger replicate_pagila_to_target
+# Replicate Stack Overflow data from source to target
+astro dev run dags unpause replicate_stackoverflow_to_target
+astro dev run dags trigger replicate_stackoverflow_to_target
 ```
 
-### Step 5: Verify
+### Step 6: Verify
+
 ```bash
-# For Postgres target
-docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM rental;"
-
-# For SQL Server target
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT COUNT(*) FROM dbo.rental;"
+# Check row counts on target
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE stackoverflow_target; SELECT 'Users' AS TableName, COUNT(*) AS RowCount FROM dbo.Users \
+   UNION ALL SELECT 'Posts', COUNT(*) FROM dbo.Posts \
+   UNION ALL SELECT 'Comments', COUNT(*) FROM dbo.Comments \
+   UNION ALL SELECT 'Votes', COUNT(*) FROM dbo.Votes \
+   UNION ALL SELECT 'Badges', COUNT(*) FROM dbo.Badges;"
 ```
-Expected: 16,044 rows in rental table
+
+Expected row counts (StackOverflow2010 database):
+- Users: ~315,000
+- Posts: ~1.7 million
+- Comments: ~1.3 million
+- Votes: ~4.3 million
+- Badges: ~190,000
 
 ---
 
 ## Project Overview
 
-This is a **Pagila End-to-End Data Replication Pipeline** using Apache Airflow 3 and PostgreSQL/SQL Server. It demonstrates production-quality data engineering practices including idempotent data loading, memory-capped streaming replication, audit logging, and resource management.
+This is a **Stack Overflow End-to-End Data Replication Pipeline** using Apache Airflow 3 and Microsoft SQL Server. It demonstrates production-quality data engineering practices including memory-capped streaming replication, audit logging, and resource management for large-scale datasets.
 
 **Key Components:**
-- Source PostgreSQL database (port 5433) with Pagila sample data (DVD rental store)
-- Target database: PostgreSQL (port 5444) OR SQL Server (port 1433)
+- Source SQL Server database (port 1433) with StackOverflow2010 sample data (Brent Ozar edition)
+- Target SQL Server database (port 1434)
 - Apache Airflow DAGs for orchestration
 - Audit trail and data validation
-- Cross-database replication with type conversion support
+- Memory-efficient streaming replication with 128MB buffer
+
+**Stack Overflow Database:**
+- Source: Brent Ozar's StackOverflow2010 database
+- Size: 8.4GB (.mdf) + 256MB (.ldf)
+- Data: 2008-2010 Stack Overflow posts, users, comments, votes, badges
+- License: CC-BY-SA 3.0
+- Download: https://downloads.brentozar.com/StackOverflow2010.7z
 
 ## Development Commands
 
@@ -116,103 +151,51 @@ astro dev stop           # Stop all containers
 
 ### Testing
 ```bash
-astro dev run pytest tests/dags                    # Run DAG validation tests
-astro dev run dags test load_pagila_to_postgres <date>  # Dry-run specific DAG
+astro dev run pytest tests/dags                                  # Run DAG validation tests
+astro dev run dags test replicate_stackoverflow_to_target <date>  # Dry-run specific DAG
 ```
 
 ### DAG Operations
 ```bash
-astro dev run dags unpause load_pagila_to_postgres     # Enable DAG scheduling
-astro dev run dags trigger load_pagila_to_postgres     # Manual trigger
-astro dev run dags trigger replicate_pagila_to_target  # Trigger replication
-astro dev run connections list                         # View Airflow connections
+astro dev run dags unpause replicate_stackoverflow_to_target   # Enable DAG scheduling
+astro dev run dags trigger replicate_stackoverflow_to_target   # Manual trigger
+astro dev run connections list                                  # View Airflow connections
 ```
 
-### Database Setup
+### Database Inspection
 
-#### PostgreSQL Source (Always Required)
 ```bash
-# Start source database
-docker run -d --name pagila-pg-source \
-  -e POSTGRES_DB=pagila -e POSTGRES_USER=pagila -e POSTGRES_PASSWORD=pagila_pw \
-  -p 5433:5432 postgres:16
-```
+# Check source database tables
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE StackOverflow2010; SELECT name FROM sys.tables ORDER BY name;"
 
-#### Target Database (Choose One)
-
-**Option A: PostgreSQL Target**
-```bash
-# Start Postgres target database  
-docker run -d --name pagila-pg-target \
-  -e POSTGRES_DB=pagila -e POSTGRES_USER=pagila_tgt -e POSTGRES_PASSWORD=pagila_tgt_pw \
-  -p 5444:5432 postgres:16
-```
-
-**Option B: SQL Server Target**
-```bash
-# Start SQL Server target (Azure SQL Edge for ARM64/AMD64 compatibility)
-docker run -d --name pagila-mssql-target \
-  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=PagilaPass123!" \
-  -p 1433:1433 mcr.microsoft.com/azure-sql-edge:latest
-```
-
-#### Network Connection
-```bash
-# Find Astro network
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'pagila-demo-project.*_airflow')
-
-# Connect source (always required)
-docker network connect $ASTRO_NETWORK pagila-pg-source
-
-# Connect target (choose one based on your setup)
-docker network connect $ASTRO_NETWORK pagila-pg-target      # for Postgres target
-docker network connect $ASTRO_NETWORK pagila-mssql-target   # for SQL Server target
-```
-
-### Download SQL Files
-```bash
-# Postgres schema and data (required for source, Postgres target)
-curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-schema.sql -o include/pagila/schema.sql
-curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-data.sql -o include/pagila/data.sql
-
-# Note: schema_mssql.sql is already in the repository for SQL Server target
+# Check target database tables
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE stackoverflow_target; SELECT name FROM sys.tables ORDER BY name;"
 ```
 
 ## Architecture Overview
 
-### DAGs Structure
-1. **`load_pagila_dag.py`** - Idempotent source data loading
-   - Uses SHA256 hashing to prevent duplicate loads
-   - Records audit trail in `pagila_support.pagila_load_audit`
-   - Resets `public` schema and loads fresh data
-   - Stream processes COPY blocks from SQL files
+### DAG Structure
 
-2. **`replicate_pagila_to_target.py`** - Memory-capped streaming replication
-   - **Postgres Target**: Uses `SpooledTemporaryFile` with direct COPY TO/FROM streaming
-   - **SQL Server Target**: Uses CSV-based bulk loading with `io.TextIOWrapper` and batch INSERT
-   - Memory limit: 128MB in-memory buffer before disk spill
-   - Copies tables in dependency order to maintain referential integrity
-   - Fixes auto-increment sequences after copy (setval for Postgres, DBCC CHECKIDENT for SQL Server)
-   - Logs memory usage and disk spill events
-
-### Target Database Support
-The replication DAG supports both **PostgreSQL** and **SQL Server** targets:
-
-| Feature | Postgres Target | SQL Server Target |
-|---------|----------------|-------------------|
-| Hook | `PostgresHook` | `MsSqlHook` |
-| Connection ID | `pagila_tgt` | `pagila_mssql` |
-| Schema File | `schema.sql` | `schema_mssql.sql` |
-| Data Transfer | COPY TO/FROM binary | CSV + batch INSERT |
-| Truncate | `TRUNCATE TABLE` | `DELETE FROM` |
-| Sequences | `setval()` | `DBCC CHECKIDENT` |
-| Required Packages | psycopg2-binary | pymssql, apache-airflow-providers-microsoft-mssql |
+**`replicate_stackoverflow_to_target.py`** - Memory-capped streaming replication
+- Creates target database and schema
+- Copies tables in dependency order
+- Uses CSV-based bulk loading with batch INSERT
+- Memory limit: 128MB in-memory buffer before disk spill
+- Logs memory usage and disk spill events
+- Aligns identity sequences after copy (DBCC CHECKIDENT)
 
 ### Table Dependency Order
+
 ```
-language → category → actor → film → film_actor → film_category → 
-country → city → address → store → customer → staff → 
-inventory → rental → payment
+Users → Badges
+     → Posts → PostHistory
+             → PostLinks
+             → Comments
+             → Votes
+     → Tags (if present)
+     → VoteTypes
 ```
 
 ### Key Configuration
@@ -228,14 +211,8 @@ inventory → rental → payment
 - No import errors allowed
 
 ### Connection IDs
-- `pagila_postgres` - Source database connection (always Postgres)
-- `pagila_tgt` - Postgres target database connection
-- `pagila_mssql` - SQL Server target database connection
-
-### File Paths
-- SQL files (Postgres): `/usr/local/airflow/include/pagila/schema.sql`, `/usr/local/airflow/include/pagila/data.sql`
-- SQL files (SQL Server): `/usr/local/airflow/include/pagila/schema_mssql.sql`
-- Use `template_searchpath=["/usr/local/airflow/include"]` in DAG definition
+- `stackoverflow_source` - Source SQL Server database (StackOverflow2010)
+- `stackoverflow_target` - Target SQL Server database
 
 ### Python Style
 - Python 3.10+ with type hints
@@ -246,113 +223,77 @@ inventory → rental → payment
 ## Technology Stack
 
 - **Apache Airflow 3** on Astro Runtime 3.1-3
-- **PostgreSQL 16** for source and optional target databases
-- **SQL Server** (Azure SQL Edge) for optional target database
-- **Python 3.10+** with psycopg2-binary (Postgres) or pymssql (SQL Server)
+- **Microsoft SQL Server** (Azure SQL Edge) for source and target databases
+- **Python 3.10+** with pymssql
 - **Docker** for database containerization
 - **pytest** for DAG validation
 
-## SQL Server Type Conversions
+## Stack Overflow Database Schema
 
-When using SQL Server as the target, the following type conversions are applied:
+### Main Tables
 
-| PostgreSQL Type | SQL Server Type | Notes |
-|----------------|----------------|-------|
-| `SERIAL` / `BIGSERIAL` | `INT IDENTITY(1,1)` | Auto-increment primary keys |
-| `TEXT` | `NVARCHAR(MAX)` | Unicode support |
-| `VARCHAR(n)` | `NVARCHAR(n)` | Unicode support |
-| `TIMESTAMP` | `DATETIME2` | Higher precision |
-| `BOOLEAN` | `BIT` | True/False → 1/0 |
-| `BYTEA` | `VARBINARY(MAX)` | Binary data |
-| `NUMERIC` | `DECIMAL` | Exact numeric |
-| `NOW()` | `GETDATE()` | Current timestamp |
+| Table | Description | Approximate Rows (2010) |
+|-------|-------------|------------------------|
+| Users | User accounts and profiles | 315,000 |
+| Posts | Questions and answers | 1,700,000 |
+| Comments | Comments on posts | 1,300,000 |
+| Votes | Upvotes/downvotes | 4,300,000 |
+| Badges | User achievements | 190,000 |
+| PostHistory | Edit history | 2,800,000 |
+| PostLinks | Related/duplicate posts | 100,000 |
+| Tags | Question categorization | 13,000 |
+| VoteTypes | Vote type lookup | ~15 |
 
-**Removed PostgreSQL-specific features:**
-- `DOMAIN` types (converted to base types with constraints)
-- `ENUM` types (converted to `NVARCHAR` with check constraints)
-- `pl/pgsql` functions and triggers
-- `GO` batch separators (not supported by pymssql)
+### Key Relationships
 
-See `MSSQL_MIGRATION.md` for complete conversion details and troubleshooting.
+- `Users.Id` → `Posts.OwnerUserId`, `Comments.UserId`, `Badges.UserId`
+- `Posts.Id` → `Comments.PostId`, `Votes.PostId`, `PostHistory.PostId`, `PostLinks.PostId`
+- `Posts.ParentId` → `Posts.Id` (answers reference questions)
+- `VoteTypes.Id` → `Votes.VoteTypeId`
 
 ## Key Files
 
-- `dags/load_pagila_dag.py` - Source data loading with idempotency
-- `dags/replicate_pagila_to_target.py` - Streaming replication logic (supports Postgres and SQL Server)
-- `include/pagila/schema.sql` - Pagila database schema (Postgres)
-- `include/pagila/schema_mssql.sql` - Pagila database schema (SQL Server T-SQL)
-- `include/pagila/data.sql` - Pagila sample data
+- `dags/replicate_stackoverflow_to_target.py` - Streaming replication logic
+- `include/stackoverflow/StackOverflow2010.mdf` - Source database file (8.4GB)
+- `include/stackoverflow/StackOverflow2010_log.ldf` - Transaction log (256MB)
+- `include/stackoverflow/Readme_2010.txt` - Database documentation
 - `tests/dags/test_dag_example.py` - DAG validation tests
 - `.astro/config.yaml` - Resource allocation settings
 - `Dockerfile` - Airflow parallelism configuration
-- `MSSQL_MIGRATION.md` - SQL Server migration guide and troubleshooting
-- `AGENTS.md` - Repository guidelines for AI agents and contributors
+- `AGENTS.md` - Repository guidelines for AI agents
 
 ## Verification Commands
 
-### PostgreSQL Target
-```bash
-# Check row counts on Postgres target
-docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM actor;"
+### Row Count Verification
 
-# View audit history on source
-docker exec -it pagila-pg-source psql -U pagila -d pagila -c "SELECT loaded_at, schema_sha256, data_sha256, succeeded FROM pagila_support.pagila_load_audit ORDER BY loaded_at DESC LIMIT 5;"
+```bash
+# Comprehensive row count check
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
+  "USE stackoverflow_target;
+   SELECT 'Users' AS TableName, COUNT(*) AS RowCount FROM dbo.Users
+   UNION ALL SELECT 'Posts', COUNT(*) FROM dbo.Posts
+   UNION ALL SELECT 'Comments', COUNT(*) FROM dbo.Comments
+   UNION ALL SELECT 'Votes', COUNT(*) FROM dbo.Votes
+   UNION ALL SELECT 'Badges', COUNT(*) FROM dbo.Badges
+   UNION ALL SELECT 'PostHistory', COUNT(*) FROM dbo.PostHistory
+   UNION ALL SELECT 'PostLinks', COUNT(*) FROM dbo.PostLinks
+   UNION ALL SELECT 'Tags', COUNT(*) FROM dbo.Tags
+   UNION ALL SELECT 'VoteTypes', COUNT(*) FROM dbo.VoteTypes
+   ORDER BY TableName;"
 ```
 
-### SQL Server Target
-```bash
-# Check row counts on SQL Server target
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'actor' AS table_name, COUNT(*) AS row_count FROM dbo.actor;"
+### Performance Metrics
 
-# Check all table counts
-docker exec -it pagila-mssql-target /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "PagilaPass123!" -Q "USE pagila_target; SELECT 'language' AS t, COUNT(*) AS c FROM dbo.language UNION ALL SELECT 'rental', COUNT(*) FROM dbo.rental UNION ALL SELECT 'payment', COUNT(*) FROM dbo.payment;"
-```
+Expected replication performance (StackOverflow2010):
+- Total dataset: ~10GB (compressed) / ~8.4GB (uncompressed .mdf)
+- Estimated runtime: 10-30 minutes (depending on hardware)
+- Memory usage: <128MB per task (spills to disk above threshold)
+- Largest tables: Votes (~4.3M rows), PostHistory (~2.8M rows), Posts (~1.7M rows)
 
-### Expected Row Counts (All Targets)
-- language: 6
-- category: 16
-- actor: 200
-- film: 1,000
-- film_actor: 5,462
-- film_category: 1,000
-- country: 109
-- city: 600
-- address: 605
-- store: 2
-- customer: 599
-- staff: 2
-- inventory: 4,581
-- rental: 16,044
-- payment: 16,049
+## License and Attribution
 
-## SQL Server Replication Status
-
-✅ **Fully Tested and Working** (as of 2024-12-08)
-
-The SQL Server target replication has been extensively tested and successfully replicates all 15 tables from PostgreSQL source to Azure SQL Edge target.
-
-**Test Results:**
-- **DAG Status**: SUCCESS
-- **Runtime**: ~29 seconds
-- **Tables Replicated**: 15/15 (100%)
-- **Total Rows**: 45,000+
-- **Data Validation**: All row counts match expected values
-- **Identity Sequences**: Successfully aligned
-
-**All 14 Migration Challenges Solved:**
-1. ✅ IDENTITY_INSERT handling
-2. ✅ Datetime timezone conversion
-3. ✅ Column count matching
-4. ✅ Conditional IDENTITY_INSERT detection
-5. ✅ Empty string vs NULL handling
-6. ✅ Boolean conversion (t/f → 1/0)
-7. ✅ Circular FK dependencies (store ↔ staff)
-8. ✅ VARCHAR size adjustments
-9. ✅ Schema differences (payment.last_update, film.fulltext)
-10. ✅ GO batch separator removal
-11. ✅ Autocommit API compatibility
-12. ✅ Binary vs text mode handling
-13. ✅ TRUNCATE to DELETE conversion
-14. ✅ Database connection and creation
-
-For detailed troubleshooting and all solutions, see `MSSQL_MIGRATION.md`.
+The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
+- Source: https://archive.org/details/stackexchange
+- Compiled by: Brent Ozar Unlimited (https://www.brentozar.com)
+- You are free to share and adapt this database, even commercially
+- Attribution required to Stack Exchange Inc. and original authors

@@ -1,5 +1,5 @@
 project:
-    name: pagila-demo-project
+    name: stackoverflow-replication-pipeline
 
 # Local environment resource allocation for warehouse-scale streaming
 local:
