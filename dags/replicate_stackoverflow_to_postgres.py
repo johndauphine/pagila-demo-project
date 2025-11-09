@@ -238,7 +238,9 @@ def create_target_schema() -> None:
                 col_def += " GENERATED ALWAYS AS IDENTITY"
 
             # Add NULL/NOT NULL
-            if is_nullable == 'NO':
+            # Special case: Allow NULL for text columns even if source says NOT NULL
+            # to handle empty strings that get converted to NULL during CSV export
+            if is_nullable == 'NO' and pg_type not in ('TEXT', 'VARCHAR') and not pg_type.startswith('VARCHAR('):
                 col_def += " NOT NULL"
             else:
                 col_def += " NULL"
