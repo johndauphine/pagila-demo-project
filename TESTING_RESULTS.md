@@ -189,6 +189,16 @@ if rows_since_last_commit >= commit_frequency:
 
 ### Test Date: November 9, 2025
 
+> **⚠️ Test Environment Note: ARM64 Emulation**
+>
+> Testing was performed on macOS ARM64 (Apple Silicon) with:
+> - **SQL Server source**: Running in x86_64 emulation mode (`--platform linux/amd64`)
+> - **PostgreSQL target**: Running natively on ARM64
+> - **Performance impact**: SQL Server emulation adds overhead (slower than native AMD64)
+> - **Stability note**: Small dataset testing successful, but large datasets may trigger emulation-related crashes
+>
+> **Production recommendation**: For ARM64 systems, run SQL Server source on cloud AMD64 VM for best performance and stability.
+
 ### What Works ✅
 
 #### 1. Cross-Database Replication
@@ -295,12 +305,19 @@ Votes      |      1000
 ### For Production Use
 
 **✅ RECOMMENDED: Use SQL Server → PostgreSQL Pipeline**
-- Works on all architectures (ARM64, AMD64, x86_64)
 - Production-ready and fully tested
 - Fork-safe driver (pg8000) for LocalExecutor
 - No SQL Server licensing costs for target database
-- Excellent performance for analytical workloads
+- Excellent performance for analytical workloads (when source is not emulated)
 - All features verified working
+
+**⚠️ ARM64 (Apple Silicon) Considerations:**
+- **PostgreSQL target**: Runs natively on ARM64 ✅
+- **SQL Server source**: Requires x86_64 emulation on ARM64 ⚠️
+  - Performance: Slower due to Rosetta 2 translation
+  - Stability: Can crash with large datasets (>100K rows)
+  - **Best practice**: Run SQL Server source on cloud AMD64 VM (AWS/Azure/GCP)
+  - **Alternative**: Use PostgreSQL → PostgreSQL (fully native, no emulation)
 
 **Alternative: SQL Server → SQL Server (AMD64 only)**
 

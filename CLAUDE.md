@@ -118,6 +118,17 @@ Expected row counts (StackOverflow2010 database):
 
 ## Alternative Setup: SQL Server to PostgreSQL Replication
 
+> **⚠️ CRITICAL: macOS ARM64 (Apple Silicon) Limitation**
+>
+> **SQL Server 2022 does NOT natively support ARM64.** On M-series Macs:
+> - SQL Server runs in **x86_64 emulation** (Rosetta 2)
+> - **Performance**: Slower (emulation overhead)
+> - **Stability**: Can crash during heavy operations
+> - **Best for macOS ARM64**: Run SQL Server source on cloud AMD64 VM (AWS/Azure/GCP)
+> - **Alternative**: Use PostgreSQL → PostgreSQL (fully native ARM64)
+>
+> For local testing on ARM64, expect slower performance and potential crashes with large datasets.
+
 ### Step 1: Start Astro
 ```bash
 astro dev start
@@ -129,7 +140,8 @@ astro dev start
 
 ```bash
 # Start SQL Server 2022 source with StackOverflow2010 database
-# Requires AMD64/x86_64 architecture (SQL Server 2022 does not support ARM64)
+# Note: On ARM64 (Apple Silicon), this runs in x86_64 emulation mode (slower, less stable)
+# Requires AMD64/x86_64 architecture OR ARM64 with emulation
 docker run -d --name stackoverflow-mssql-source \
   --platform linux/amd64 \
   --memory="4g" \

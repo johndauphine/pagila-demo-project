@@ -23,7 +23,30 @@ This project provides complete, production-quality data replication pipelines us
 
 ---
 
-## 2. Prerequisites
+## 2. Platform Requirements
+
+### Supported Architectures
+
+| Component | AMD64/x86_64 | ARM64 (Apple Silicon) |
+|-----------|--------------|----------------------|
+| **Airflow** | ✅ Native | ✅ Native |
+| **PostgreSQL target** | ✅ Native | ✅ Native |
+| **SQL Server source** | ✅ Native | ⚠️ Emulated (Rosetta 2) |
+| **SQL Server target** | ✅ Native | ⚠️ Emulated (Rosetta 2) |
+
+> **⚠️ macOS ARM64 (M1/M2/M3/M4) Users:**
+>
+> SQL Server 2022 does NOT support ARM64 natively. It runs in x86_64 emulation mode on Apple Silicon:
+> - **Performance**: Slower (emulation overhead)
+> - **Stability**: Can crash with large datasets (>100K rows)
+> - **Recommended**:
+>   - For SQL Server → PostgreSQL: Run SQL Server source on cloud AMD64 VM (see Section 9.7)
+>   - For SQL Server → SQL Server: Use full AMD64 hardware or cloud VMs
+> - **Alternative**: Use PostgreSQL → PostgreSQL pipeline (fully native ARM64, no emulation)
+
+---
+
+## 3. Prerequisites
 
 - **Docker Desktop** - For running SQL Server containers
 - **Astro CLI** - Astronomer's local development tool
@@ -48,9 +71,9 @@ astro dev restart
 
 ---
 
-## 3. Download and Extract Stack Overflow Database
+## 4. Download and Extract Stack Overflow Database
 
-### 3.1 Download StackOverflow2010
+### 4.1 Download StackOverflow2010
 
 Download the 1GB compressed database file:
 
@@ -60,7 +83,7 @@ cd include/stackoverflow
 curl -L -o StackOverflow2010.7z https://downloads.brentozar.com/StackOverflow2010.7z
 ```
 
-### 3.2 Extract Database Files
+### 4.2 Extract Database Files
 
 ```bash
 7z x StackOverflow2010.7z
@@ -73,9 +96,9 @@ This extracts:
 
 ---
 
-## 4. Start SQL Server Containers
+## 5. Start SQL Server Containers
 
-### 4.1 Start Astro Environment
+### 5.1 Start Astro Environment
 
 ```bash
 astro dev start
@@ -83,7 +106,7 @@ astro dev start
 
 This creates the Airflow environment and a Docker network for inter-container communication.
 
-### 4.2 Start Source SQL Server Container
+### 5.2 Start Source SQL Server Container
 
 ```bash
 docker run -d \
@@ -96,7 +119,7 @@ docker run -d \
   mcr.microsoft.com/azure-sql-edge:latest
 ```
 
-### 4.3 Start Target SQL Server Container
+### 5.3 Start Target SQL Server Container
 
 ```bash
 docker run -d \
@@ -112,7 +135,7 @@ docker run -d \
 >
 > **⚠️ Important**: Azure SQL Edge has known stability issues on ARM64 with large datasets. The `--memory="4g"` flag allocates 4GB RAM to improve stability. See section 11.5 for detailed troubleshooting if containers crash.
 
-### 4.4 Connect Containers to Astro Network
+### 5.4 Connect Containers to Astro Network
 
 ```bash
 # Discover the Astro network name
@@ -125,7 +148,7 @@ docker network connect $ASTRO_NETWORK stackoverflow-mssql-target
 
 ---
 
-## 5. Attach Source Database
+## 6. Attach Source Database
 
 Copy the database files into the source container and attach the database:
 
@@ -142,7 +165,7 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
   "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH;"
 ```
 
-### 5.1 Verify Source Database
+### 6.1 Verify Source Database
 
 ```bash
 # List tables in source database
@@ -163,9 +186,9 @@ Expected tables:
 
 ---
 
-## 6. Configure Airflow Connections
+## 7. Configure Airflow Connections
 
-### 6.1 Add Source Connection
+### 7.1 Add Source Connection
 
 ```bash
 astro dev run connections add stackoverflow_source \
@@ -177,7 +200,7 @@ astro dev run connections add stackoverflow_source \
   --conn-schema StackOverflow2010
 ```
 
-### 6.2 Add Target Connection
+### 7.2 Add Target Connection
 
 ```bash
 astro dev run connections add stackoverflow_target \
@@ -189,7 +212,7 @@ astro dev run connections add stackoverflow_target \
   --conn-schema master
 ```
 
-### 6.3 Verify Connections
+### 7.3 Verify Connections
 
 ```bash
 astro dev run connections list
@@ -201,9 +224,9 @@ You should see:
 
 ---
 
-## 7. Run the Replication DAG
+## 8. Run the Replication DAG
 
-### 7.1 Unpause and Trigger DAG
+### 8.1 Unpause and Trigger DAG
 
 ```bash
 # Enable the DAG
@@ -213,7 +236,7 @@ astro dev run dags unpause replicate_stackoverflow_to_target
 astro dev run dags trigger replicate_stackoverflow_to_target
 ```
 
-### 7.2 Monitor DAG Execution
+### 8.2 Monitor DAG Execution
 
 Access the Airflow UI at **http://localhost:8080**
 
@@ -225,7 +248,7 @@ Navigate to:
 2. **Graph View** to see task dependencies
 3. **Logs** to view detailed execution logs
 
-### 7.3 Expected Runtime
+### 8.3 Expected Runtime
 
 - **Small tables** (Users, Badges, Tags): ~5-10 seconds each
 - **Medium tables** (Posts, Comments): ~30-60 seconds each
@@ -234,9 +257,9 @@ Navigate to:
 
 ---
 
-## 8. Verify Replication
+## 9. Verify Replication
 
-### 8.1 Row Count Verification
+### 9.1 Row Count Verification
 
 ```bash
 docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
@@ -253,7 +276,7 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
    ORDER BY TableName;"
 ```
 
-### 8.2 Expected Row Counts
+### 9.2 Expected Row Counts
 
 | Table | Expected Rows |
 |-------|--------------|
@@ -267,7 +290,7 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
 | VoteTypes | ~15 |
 | Votes | ~4,300,000 |
 
-### 8.3 Sample Data Query
+### 9.3 Sample Data Query
 
 ```bash
 # Get top 10 users by reputation
@@ -277,18 +300,34 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ---
 
-## 9. Alternative Setup: SQL Server to PostgreSQL Replication
+## 10. Alternative Setup: SQL Server to PostgreSQL Replication
 
 This setup replicates data from SQL Server to PostgreSQL, providing cross-platform compatibility and cost benefits.
 
-### 9.1 Benefits
+> **⚠️ IMPORTANT: macOS ARM64 (Apple Silicon) Limitation**
+>
+> **SQL Server 2022 does NOT support ARM64 architecture natively.** On macOS with M-series chips (M1, M2, M3, M4):
+> - SQL Server source runs in **x86_64 emulation mode** (Rosetta 2 translation layer)
+> - Uses `--platform linux/amd64` flag to force emulation
+> - **Performance**: 🐌 Slower than native (emulation overhead)
+> - **Stability**: ⚠️ Can be unstable, may crash during heavy operations
+> - **Resource usage**: Higher CPU/memory consumption due to emulation
+>
+> **Recommended for macOS ARM64 users:**
+> 1. **Cloud-based source** (BEST): Run SQL Server on AWS/Azure/GCP AMD64 VM, connect Airflow to it
+> 2. **Accept limitations**: Use emulated SQL Server locally for small datasets only (<10K rows)
+> 3. **Alternative**: Use PostgreSQL → PostgreSQL pipeline (fully native ARM64, no emulation)
+>
+> For **production workloads** or **large datasets** on ARM64, use Option 1 (cloud-based source).
 
-- **Cross-platform compatibility**: PostgreSQL runs natively on ARM64 (Apple Silicon), AMD64, and all major operating systems
+### 10.1 Benefits
+
+- **PostgreSQL target**: Runs natively on ARM64 (Apple Silicon), AMD64, and all major operating systems
 - **No licensing costs**: PostgreSQL is open source
-- **Better performance** for analytical workloads and data warehousing
+- **Better performance** for analytical workloads and data warehousing (when source is not emulated)
 - **Production-ready**: Uses fork-safe pg8000 driver for LocalExecutor compatibility
 
-### 9.2 Setup PostgreSQL Target
+### 10.2 Setup PostgreSQL Target
 
 ```bash
 # Start PostgreSQL 16 target container
@@ -305,7 +344,7 @@ ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow.*_a
 docker network connect $ASTRO_NETWORK stackoverflow-postgres-target
 ```
 
-### 9.3 Create PostgreSQL Connection
+### 10.3 Create PostgreSQL Connection
 
 ```bash
 astro dev run connections add stackoverflow_postgres_target \
@@ -317,7 +356,7 @@ astro dev run connections add stackoverflow_postgres_target \
   --conn-schema stackoverflow_target
 ```
 
-### 9.4 Run PostgreSQL Replication DAG
+### 10.4 Run PostgreSQL Replication DAG
 
 ```bash
 # Enable and trigger the PostgreSQL DAG
@@ -325,7 +364,7 @@ astro dev run dags unpause replicate_stackoverflow_to_postgres
 astro dev run dags trigger replicate_stackoverflow_to_postgres
 ```
 
-### 9.5 Verify PostgreSQL Replication
+### 10.5 Verify PostgreSQL Replication
 
 ```bash
 # Check row counts in PostgreSQL
@@ -338,7 +377,7 @@ docker exec stackoverflow-postgres-target psql -U postgres -d stackoverflow_targ
    ORDER BY table_name;"
 ```
 
-### 9.6 PostgreSQL-Specific Features
+### 10.6 PostgreSQL-Specific Features
 
 **Data Type Mapping:**
 | SQL Server | PostgreSQL |
@@ -359,7 +398,40 @@ docker exec stackoverflow-postgres-target psql -U postgres -d stackoverflow_targ
 - No need for `SET IDENTITY_INSERT` equivalent
 - Sequence management with **setval()** instead of **DBCC CHECKIDENT**
 
-### 9.7 Troubleshooting PostgreSQL DAG
+### 10.7 Cloud-Based SQL Server Source (Recommended for macOS ARM64)
+
+For best performance and stability on macOS ARM64, run SQL Server source on a cloud AMD64 VM:
+
+**Example: AWS EC2 Setup**
+```bash
+# 1. Launch Ubuntu AMD64 instance on AWS (t3.medium or larger)
+# 2. Install Docker on the VM
+# 3. Run SQL Server container on the VM
+docker run -d --name stackoverflow-mssql-source \
+  --memory="4g" \
+  -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
+  -e "MSSQL_PID=Developer" \
+  -p 1433:1433 \
+  mcr.microsoft.com/mssql/server:2022-latest
+
+# 4. Update security group to allow port 1433 from your IP
+# 5. Update Airflow connection to use cloud VM IP
+astro dev run connections add stackoverflow_source \
+  --conn-type mssql \
+  --conn-host <ec2-public-ip-or-dns> \
+  --conn-port 1433 \
+  --conn-login sa \
+  --conn-password "StackOverflow123!" \
+  --conn-schema StackOverflow2010
+```
+
+**Benefits:**
+- ✅ Native AMD64 performance (no emulation)
+- ✅ Stable for large datasets
+- ✅ Production-like setup
+- ✅ PostgreSQL target still runs locally on native ARM64
+
+### 10.8 Troubleshooting PostgreSQL DAG
 
 **Issue:** Tasks fail with `SIGKILL: -9` error
 
@@ -376,11 +448,17 @@ astro dev restart
 
 PostgresHook will automatically use pg8000 when available, avoiding fork issues.
 
+**Issue:** SQL Server source crashes on macOS ARM64
+
+**Cause:** SQL Server 2022 runs in x86_64 emulation mode on ARM64
+
+**Solution:** Use cloud-based SQL Server source (see Section 10.7) or accept limitations for small datasets only.
+
 ---
 
-## 10. Architecture Overview
+## 11. Architecture Overview
 
-### 10.1 DAG Structure
+### 11.1 DAG Structure
 
 **File**: `dags/replicate_stackoverflow_to_target.py` (SQL Server → SQL Server)
 
@@ -402,7 +480,7 @@ PostgresHook will automatically use pg8000 when available, avoiding fork issues.
 - Sequence management with setval()
 - Fork-safe pg8000 driver for LocalExecutor compatibility
 
-### 10.2 Table Replication Order
+### 11.2 Table Replication Order
 
 Tables are replicated in dependency order to maintain referential integrity:
 
@@ -418,7 +496,7 @@ Tables are replicated in dependency order to maintain referential integrity:
 9. Votes (depends on Posts, VoteTypes)
 ```
 
-### 10.3 Memory Management
+### 11.3 Memory Management
 
 - **SpooledTemporaryFile**: Uses 128MB in-memory buffer
 - **Disk Spillover**: Automatically writes to disk when buffer exceeds threshold
@@ -427,7 +505,7 @@ Tables are replicated in dependency order to maintain referential integrity:
 
 ---
 
-## 11. Project Structure
+## 12. Project Structure
 
 ```
 stackoverflow-demo-project/
@@ -453,9 +531,9 @@ stackoverflow-demo-project/
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
-### 12.1 Database Connection Issues
+### 13.1 Database Connection Issues
 
 **Problem**: "Login failed for user 'sa'"
 
@@ -471,7 +549,7 @@ docker logs stackoverflow-mssql-source
 sleep 30
 ```
 
-### 12.2 Database Attach Fails
+### 13.2 Database Attach Fails
 
 **Problem**: "Unable to open the physical file" or "Operating system error 5"
 
@@ -485,7 +563,7 @@ docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.m
 docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.ldf
 ```
 
-### 12.3 Memory Issues
+### 13.3 Memory Issues
 
 **Problem**: "Out of memory" or slow performance
 
@@ -493,7 +571,7 @@ docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.l
 - Docker Desktop → Settings → Resources → Memory: 8GB+
 - Edit `.astro/config.yaml` to reduce parallelism
 
-### 12.4 DAG Import Errors
+### 13.4 DAG Import Errors
 
 **Problem**: DAG doesn't appear in Airflow UI
 
@@ -509,7 +587,7 @@ astro dev run dags list-import-errors
 astro dev restart
 ```
 
-### 12.5 Azure SQL Edge Stability Issues (IMPORTANT)
+### 13.5 Azure SQL Edge Stability Issues (IMPORTANT)
 
 **Problem**: SQL Server container crashes with `SIGABRT` or exits unexpectedly during:
 - Database initialization
@@ -596,21 +674,21 @@ docker run -d --name stackoverflow-mssql-target \
 
 ---
 
-## 13. Development and Testing
+## 14. Development and Testing
 
-### 13.1 Run DAG Tests
+### 14.1 Run DAG Tests
 
 ```bash
 astro dev run pytest tests/dags -v
 ```
 
-### 13.2 Dry-Run DAG
+### 14.2 Dry-Run DAG
 
 ```bash
 astro dev run dags test replicate_stackoverflow_to_target 2025-01-01
 ```
 
-### 13.3 View Logs
+### 14.3 View Logs
 
 ```bash
 # Scheduler logs
@@ -622,9 +700,9 @@ http://localhost:8080 → DAGs → replicate_stackoverflow_to_target → Logs
 
 ---
 
-## 14. Cleanup
+## 15. Cleanup
 
-### 14.1 Stop Containers
+### 15.1 Stop Containers
 
 ```bash
 # Stop Airflow
@@ -635,7 +713,7 @@ docker stop stackoverflow-mssql-source stackoverflow-mssql-target
 docker rm stackoverflow-mssql-source stackoverflow-mssql-target
 ```
 
-### 14.2 Remove Database Files (Optional)
+### 15.2 Remove Database Files (Optional)
 
 ```bash
 # Remove compressed archive (keep .mdf and .ldf)
@@ -647,9 +725,9 @@ rm -rf include/stackoverflow/
 
 ---
 
-## 15. License and Attribution
+## 16. License and Attribution
 
-### 15.1 Stack Overflow Database
+### 16.1 Stack Overflow Database
 
 The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
 - **Source**: Stack Exchange Data Dump (https://archive.org/details/stackexchange)
@@ -664,13 +742,13 @@ The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
 - Attribution — You must give appropriate credit to Stack Exchange Inc. and original authors
 - ShareAlike — If you remix or transform the material, you must distribute under the same license
 
-### 15.2 Project Code
+### 16.2 Project Code
 
 This replication pipeline project code is provided as-is for educational and production use.
 
 ---
 
-## 16. Additional Resources
+## 17. Additional Resources
 
 - **Brent Ozar's Blog**: https://www.brentozar.com/archive/category/tools/stack-overflow-database/
 - **Stack Exchange Data Dump**: https://archive.org/details/stackexchange
@@ -680,7 +758,7 @@ This replication pipeline project code is provided as-is for educational and pro
 
 ---
 
-## 17. Next Steps
+## 18. Next Steps
 
 1. **Add Incremental Loads**: Modify DAG to support CDC or timestamp-based updates
 2. **Add Data Quality Checks**: Implement Great Expectations or custom validation
