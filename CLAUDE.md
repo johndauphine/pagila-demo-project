@@ -63,14 +63,18 @@ docker network connect $ASTRO_NETWORK stackoverflow-mssql-target
 ### Step 3: Attach Source Database
 
 ```bash
-# Copy database files into source container and attach
-docker exec -it stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
+# Copy database files into source container
+docker exec stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
 docker cp include/stackoverflow/StackOverflow2010.mdf stackoverflow-mssql-source:/var/opt/mssql/data/
 docker cp include/stackoverflow/StackOverflow2010_log.ldf stackoverflow-mssql-source:/var/opt/mssql/data/
 
-# Attach the database
-docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
-  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH;"
+# Fix file permissions (must run as root)
+docker exec -u root stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/StackOverflow2010.mdf /var/opt/mssql/data/StackOverflow2010_log.ldf
+docker exec -u root stackoverflow-mssql-source chmod 660 /var/opt/mssql/data/StackOverflow2010.mdf /var/opt/mssql/data/StackOverflow2010_log.ldf
+
+# Attach the database (note: do NOT use quotes around password in this command)
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P StackOverflow123! -C -Q \
+  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH"
 ```
 
 ### Step 4: Create Airflow Connections
@@ -166,14 +170,18 @@ docker network connect $ASTRO_NETWORK stackoverflow-postgres-target
 ### Step 3: Attach Source Database
 
 ```bash
-# Copy database files into source container and attach
-docker exec -it stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
+# Copy database files into source container
+docker exec stackoverflow-mssql-source mkdir -p /var/opt/mssql/data
 docker cp include/stackoverflow/StackOverflow2010.mdf stackoverflow-mssql-source:/var/opt/mssql/data/
 docker cp include/stackoverflow/StackOverflow2010_log.ldf stackoverflow-mssql-source:/var/opt/mssql/data/
 
-# Attach the database
-docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "StackOverflow123!" -C -Q \
-  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH;"
+# Fix file permissions (must run as root)
+docker exec -u root stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/StackOverflow2010.mdf /var/opt/mssql/data/StackOverflow2010_log.ldf
+docker exec -u root stackoverflow-mssql-source chmod 660 /var/opt/mssql/data/StackOverflow2010.mdf /var/opt/mssql/data/StackOverflow2010_log.ldf
+
+# Attach the database (note: do NOT use quotes around password in this command)
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P StackOverflow123! -C -Q \
+  "CREATE DATABASE StackOverflow2010 ON (FILENAME = '/var/opt/mssql/data/StackOverflow2010.mdf'), (FILENAME = '/var/opt/mssql/data/StackOverflow2010_log.ldf') FOR ATTACH"
 ```
 
 ### Step 4: Create Airflow Connections
@@ -353,6 +361,91 @@ Users → Badges
 - **pytest** for DAG validation
 
 ## Troubleshooting
+
+### Database File Permissions Issue (SQL Server)
+
+If you encounter permission errors when attaching the StackOverflow2010 database:
+
+**Problem:**
+```
+Msg 3415, Level 16, State 2, Server ..., Line 1
+Database 'StackOverflow2010' cannot be upgraded because it is read-only,
+has read-only files or the user does not have permissions to modify
+some of the files. Make the database or files writeable, and rerun recovery.
+```
+
+**Root Cause:**
+- Files copied with `docker cp` inherit host filesystem permissions
+- SQL Server process runs as `mssql` user inside container
+- Copied .mdf/.ldf files may not be owned by `mssql:mssql`
+- Insufficient permissions prevent database upgrade/recovery
+
+**Solution:**
+
+Fix ownership and permissions as root user before attaching:
+
+```bash
+# Set ownership to mssql user
+docker exec -u root stackoverflow-mssql-source chown mssql:mssql \
+  /var/opt/mssql/data/StackOverflow2010.mdf \
+  /var/opt/mssql/data/StackOverflow2010_log.ldf
+
+# Set read/write permissions (660)
+docker exec -u root stackoverflow-mssql-source chmod 660 \
+  /var/opt/mssql/data/StackOverflow2010.mdf \
+  /var/opt/mssql/data/StackOverflow2010_log.ldf
+```
+
+**Why This Works:**
+- `chown mssql:mssql` grants ownership to SQL Server process user
+- `chmod 660` allows read/write for owner and group, no access for others
+- SQL Server can now upgrade database from 2008 format to 2022 format
+- Database recovery completes successfully
+
+**Note:** Running `chmod` as non-root will fail with "Operation not permitted"
+
+### SQL Server SA Authentication Issue
+
+If you encounter login failures when running sqlcmd commands:
+
+**Problem:**
+```
+Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login failed for user 'sa'.
+```
+
+**Root Cause:**
+- Password contains special characters (e.g., `StackOverflow123!`)
+- Shell may interpret quotes inconsistently depending on context
+- `docker exec` with quoted password fails in certain scenarios
+
+**Solution:**
+
+**For CREATE DATABASE and most queries:** Remove quotes from password parameter:
+```bash
+# ✓ CORRECT - No quotes
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P StackOverflow123! -C -Q "SELECT @@VERSION"
+
+# ✗ WRONG - Quoted password fails
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P "StackOverflow123!" -C -Q "SELECT @@VERSION"
+```
+
+**For Airflow connections:** Use quotes to prevent shell expansion:
+```bash
+astro dev run connections add stackoverflow_source \
+  --conn-password "StackOverflow123!"  # Quotes needed here
+```
+
+**Why This Works:**
+- Without quotes, shell passes password directly to sqlcmd
+- sqlcmd receives the exact password string including `!`
+- With quotes in `docker exec`, shell may escape or modify the password
+
+**Alternative:** If authentication continues to fail:
+1. Wait 15-30 seconds after container starts for SA password initialization
+2. Restart container: `docker restart stackoverflow-mssql-source && sleep 30`
+3. Use `-d` flag to specify database: `-d StackOverflow2010`
 
 ### PostgreSQL DAG with LocalExecutor
 
