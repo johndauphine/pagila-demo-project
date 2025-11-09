@@ -372,6 +372,46 @@ Already configured in `requirements.txt`. If you have issues:
 - Use KubernetesExecutor (for cloud deployments)
 - Use `astro dev run dags test` for development testing
 
+### Empty String to NULL Conversion Issue (PostgreSQL)
+
+If you encounter `NotNullViolation` errors during PostgreSQL replication:
+
+**Problem:**
+```
+psycopg2.errors.NotNullViolation: null value in column "Body" of relation "Posts" violates not-null constraint
+DETAIL: Failing row contains (...Body = null...)
+```
+
+**Root Cause:**
+- SQL Server allows empty strings ('') in NOT NULL columns
+- During CSV export/import, empty strings are converted to NULL values
+- PostgreSQL enforces NOT NULL constraints strictly, rejecting NULL values
+- Approximately 10 rows in Posts table have empty Body values in StackOverflow2010
+
+**Solution (Implemented in `dags/replicate_stackoverflow_to_postgres.py`):**
+
+Modified schema creation to allow NULL for text/varchar columns even when source schema defines NOT NULL:
+
+```python
+# Special case: Allow NULL for text columns even if source says NOT NULL
+# to handle empty strings that get converted to NULL during CSV export
+if is_nullable == 'NO' and pg_type not in ('TEXT', 'VARCHAR') and not pg_type.startswith('VARCHAR('):
+    col_def += " NOT NULL"
+else:
+    col_def += " NULL"
+```
+
+**Why This Works:**
+- Empty strings in source become NULL in target (acceptable data loss)
+- Preserves data integrity for truly NULL values
+- Prevents replication failures on edge cases
+- Maintains NOT NULL constraints on non-text columns (integers, dates, etc.)
+
+**Alternative Solutions:**
+1. Pre-process source data to replace empty strings with a placeholder (e.g., '[EMPTY]')
+2. Use COALESCE() in the SELECT query to replace empty strings with a default value
+3. Modify target schema to use CHECK constraints instead of NOT NULL
+
 ## Stack Overflow Database Schema
 
 ### Main Tables
