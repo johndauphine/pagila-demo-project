@@ -15,3 +15,6 @@ airflow.db
 *.ldf
 *.7z
 *.bak
+
+# BULK INSERT temporary CSV files
+include/bulk_files/

@@ -25,30 +25,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Network Architecture
 
-**Production-Like Design**: Database containers run on **separate networks** from Airflow, simulating real production environments where databases are external services (AWS RDS, Azure SQL, etc.).
+**Production-Like Design**: Database containers are connected to the **Airflow network** to enable communication, while maintaining network isolation from the Docker host. This simulates real production environments where databases are external services (AWS RDS, Azure SQL, etc.) accessible via private networking.
 
 ```
-┌──────────────────┐
-│  Astro Network   │          External Databases
-│  ┌────────────┐  │          (Separate Networks)
-│  │  Airflow   │  │
-│  │ Scheduler  │──┼──► HOST_IP:1433 ──► SQL Server Source
-│  └────────────┘  │   (via host network)
-│                  │
-│                  │──► HOST_IP:1434 ──► SQL Server Target
-└──────────────────┘   (via host network)
+┌─────────────────────────────────────────┐
+│  Astro Network (Custom Bridge)         │
+│                                         │
+│  ┌───────────────┐    ┌──────────────┐ │
+│  │  Airflow      │───►│ SQL Server   │ │
+│  │  Scheduler    │    │ Source       │ │
+│  └───────────────┘    │ :1433        │ │
+│                       └──────────────┘ │
+│  ┌───────────────┐                     │
+│  │  Airflow      │    ┌──────────────┐ │
+│  │  Workers      │───►│ SQL Server   │ │
+│  └───────────────┘    │ Target       │ │
+│                       │ :1433        │ │
+│                       └──────────────┘ │
+└─────────────────────────────────────────┘
+         │                       │
+         │ Port Mapping          │ Port Mapping
+         ▼                       ▼
+    Host:1433              Host:1434
 ```
 
-**Platform-Specific Host IP:**
-- **Linux** (ChromeOS, Ubuntu, etc.): `172.17.0.1` (Docker bridge gateway)
-- **macOS/Windows**: `host.docker.internal` (Docker Desktop special hostname)
+**Connection Method:**
+- Database containers are connected to the **Airflow network** using `docker network connect`
+- Airflow connects using **container names** (e.g., `stackoverflow-mssql-source:1433`)
+- Ports are **also exposed** to the host for external access and debugging
 
 **Why This Design?**
-- ✓ Simulates production where databases are on separate servers/VMs
-- ✓ Tests real TCP/IP network communication (not just Docker bridge)
-- ✓ Validates firewall/port-based access control
-- ✓ Proves pipelines work with external database services
-- ✓ More secure - databases isolated from Airflow infrastructure
+- ✓ Simulates production private network connectivity (VPC peering, private endpoints)
+- ✓ Tests Docker DNS resolution (container names as hostnames)
+- ✓ Network isolation from host while enabling inter-container communication
+- ✓ Ports exposed to host allow direct debugging without entering containers
+- ✓ Survives container restarts (networks persist after reconnection)
 
 ---
 
@@ -64,29 +75,42 @@ astro dev start
 **SQL Server-to-SQL Server Replication Pipeline:**
 
 ```bash
+# Create shared directory for BULK INSERT (required for bulk loading DAG)
+mkdir -p include/bulk_files && chmod 777 include/bulk_files
+
 # Start SQL Server 2022 source with StackOverflow2010 database
 # Note: The .mdf and .ldf files are in include/stackoverflow/
 # Requires AMD64/x86_64 architecture (SQL Server 2022 does not support ARM64)
-# Port 1433 exposed to host (NOT on Astro network - production-like design)
+# Port 1433 exposed to host for debugging
+# Shared volume for BULK INSERT: include/bulk_files mounted as /bulk_files
 docker run -d --name stackoverflow-mssql-source \
   --platform linux/amd64 \
   --memory="4g" \
   -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
   -e "MSSQL_PID=Developer" \
   -v "$(pwd)/include/stackoverflow":/var/opt/mssql/backup \
+  -v "$(pwd)/include/bulk_files":/bulk_files \
   -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
 
 # Start SQL Server 2022 target (4GB RAM for heavy write operations)
-# Port 1434 exposed to host (NOT on Astro network - production-like design)
+# Port 1434 exposed to host for debugging
+# Shared volume for BULK INSERT: include/bulk_files mounted as /bulk_files
 docker run -d --name stackoverflow-mssql-target \
   --platform linux/amd64 \
   --memory="4g" \
   -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
   -e "MSSQL_PID=Developer" \
+  -v "$(pwd)/include/bulk_files":/bulk_files \
   -p 1434:1433 mcr.microsoft.com/mssql/server:2022-latest
+
+# Connect databases to Airflow network (CRITICAL for DAG connectivity)
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-mssql-source
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-mssql-target
 ```
 
-**Note:** Databases are **NOT** connected to the Astro network. Airflow accesses them via host network, simulating external database servers.
+**Note:**
+- Database containers start on the default Docker bridge network but are also connected to the Airflow network for inter-container communication.
+- The `include/bulk_files` bind mount enables BULK INSERT operations for high-performance data loading.
 
 ### Step 3: Attach Source Database
 
@@ -107,33 +131,25 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
-**IMPORTANT**: Connection host must match your platform. Using the wrong host will cause "Unable to connect" or "Connection refused" errors.
+**IMPORTANT**: Use container names as hostnames since databases are on the Airflow network.
 
-**For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
-# Source connection (via Docker bridge gateway)
+# Source connection (via Docker DNS - container name as hostname)
 astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1433 \
+  --conn-type mssql --conn-host stackoverflow-mssql-source --conn-port 1433 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
 
-# Target connection (via Docker bridge gateway)
+# Target connection (via Docker DNS - container name as hostname)
 astro dev run connections add stackoverflow_target \
-  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1434 \
+  --conn-type mssql --conn-host stackoverflow-mssql-target --conn-port 1433 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
 ```
 
-**For macOS/Windows:**
-```bash
-# Source connection (via Docker Desktop host gateway)
-astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host host.docker.internal --conn-port 1433 \
-  --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
-
-# Target connection (via Docker Desktop host gateway)
-astro dev run connections add stackoverflow_target \
-  --conn-type mssql --conn-host host.docker.internal --conn-port 1434 \
-  --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
-```
+**Why Container Names?**
+- Docker DNS automatically resolves container names to IPs on the same network
+- Works across all platforms (Linux, macOS, Windows)
+- Survives container IP changes and network restarts
+- No need to find gateway IPs or use platform-specific hostnames
 
 **Verification:**
 ```bash
@@ -173,6 +189,91 @@ Expected row counts (StackOverflow2010 database):
 
 ---
 
+## BULK INSERT Setup for Large Datasets
+
+The `replicate_stackoverflow_to_target_bulk` DAG uses SQL Server's BULK INSERT command for high-performance data loading. This approach requires a shared filesystem between Airflow and SQL Server containers.
+
+### Why Shared Volumes?
+
+**Problem**: `docker cp` doesn't work from inside Airflow containers because:
+- Airflow tasks run as forked processes within the scheduler container
+- The Docker daemon is not accessible from inside containers
+- BCP/BULK INSERT requires files to be accessible from SQL Server's filesystem
+
+**Solution**: Use bind mounts to share a directory between Airflow and SQL Server:
+- Airflow writes CSV files to `/usr/local/airflow/include/bulk_files`
+- SQL Server reads from `/bulk_files`
+- Both paths point to the same physical directory on the host: `include/bulk_files`
+
+### Architecture
+
+```
+┌─────────────────────────────────────┐
+│  Host: include/bulk_files/          │
+│  (Physical Directory)                │
+└───────┬─────────────────────┬───────┘
+        │                     │
+        │ Bind Mount          │ Bind Mount
+        ▼                     ▼
+┌──────────────────┐   ┌──────────────────┐
+│ Airflow Container│   │ SQL Server       │
+│ /usr/local/      │   │ /bulk_files/     │
+│  airflow/include/│   │                  │
+│   bulk_files/    │   │ BULK INSERT      │
+│                  │   │  reads from here │
+│ CSV export here  │   │                  │
+└──────────────────┘   └──────────────────┘
+```
+
+### Setup Already Complete
+
+If you followed Step 2 above, the shared volume is already configured:
+1. ✅ Created `include/bulk_files` with `chmod 777`
+2. ✅ Mounted as `/bulk_files` in both SQL Server containers
+3. ✅ Accessible as `/usr/local/airflow/include/bulk_files` in Airflow (Astro automatically mounts `include/`)
+
+### Running the BULK INSERT DAG
+
+```bash
+# Trigger the high-performance BULK INSERT DAG
+astro dev run dags unpause replicate_stackoverflow_to_target_bulk
+astro dev run dags trigger replicate_stackoverflow_to_target_bulk
+```
+
+### Performance Comparison
+
+| Method | Votes Table (10M rows) | Total Pipeline |
+|--------|----------------------|---------------|
+| **CSV Batch INSERT** | ~5-10 minutes | ~30-45 minutes |
+| **BULK INSERT** | ~60 seconds | ~4-8 minutes |
+| **Direct Streaming** | ~15-20 minutes | ~45-60 minutes |
+
+**Note**: BULK INSERT is 5-10x faster but requires the shared volume setup documented above.
+
+### Troubleshooting BULK INSERT
+
+**File Not Found Errors:**
+```
+Cannot bulk load. The file "/bulk_files/TableName.csv" does not exist
+```
+
+**Solution**: Verify bind mount exists in SQL Server container:
+```bash
+docker exec stackoverflow-mssql-target ls -l /bulk_files/
+```
+
+**Data Truncation Errors:**
+```
+Bulk load data conversion error (truncation) for row N, column M
+```
+
+**Solution**: Source data exceeds target column size. Options:
+1. Increase target column size in `create_heap_tables()`
+2. Truncate data during CSV export
+3. Skip problematic tables (adjust `ALL_TABLES` list)
+
+---
+
 ## Alternative Setup: SQL Server to PostgreSQL Replication
 
 > **⚠️ CRITICAL: macOS ARM64 (Apple Silicon) Limitation**
@@ -199,7 +300,7 @@ astro dev start
 # Start SQL Server 2022 source with StackOverflow2010 database
 # Note: On ARM64 (Apple Silicon), this runs in x86_64 emulation mode (slower, less stable)
 # Requires AMD64/x86_64 architecture OR ARM64 with emulation
-# Port 1433 exposed to host (NOT on Astro network - production-like design)
+# Port 1433 exposed to host for debugging
 docker run -d --name stackoverflow-mssql-source \
   --platform linux/amd64 \
   --memory="4g" \
@@ -210,15 +311,18 @@ docker run -d --name stackoverflow-mssql-source \
 
 # Start PostgreSQL 16 target (cross-platform, works on ARM64 and AMD64)
 # Port 5433 to avoid conflict with Astro's internal Postgres on 5432
-# NOT on Astro network - production-like design
 docker run -d --name stackoverflow-postgres-target \
   -e "POSTGRES_PASSWORD=StackOverflow123!" \
   -e "POSTGRES_USER=postgres" \
   -e "POSTGRES_DB=stackoverflow_target" \
   -p 5433:5432 postgres:16
+
+# Connect databases to Airflow network (CRITICAL for DAG connectivity)
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-mssql-source
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-postgres-target
 ```
 
-**Note:** Databases are **NOT** connected to the Astro network. Airflow accesses them via host network, simulating external database services like AWS RDS or Azure Database for PostgreSQL.
+**Note:** Database containers start on the default Docker bridge network but are also connected to the Airflow network for inter-container communication.
 
 ### Step 3: Attach Source Database
 
@@ -239,33 +343,21 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
-**IMPORTANT**: Connection host must match your platform. Using the wrong host will cause "Unable to connect" or "Connection refused" errors.
+**IMPORTANT**: Use container names as hostnames since databases are on the Airflow network.
 
-**For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
-# Source connection - SQL Server (via Docker bridge gateway)
+# Source connection - SQL Server (via Docker DNS)
 astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1433 \
+  --conn-type mssql --conn-host stackoverflow-mssql-source --conn-port 1433 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
 
-# Target connection - PostgreSQL (via Docker bridge gateway)
+# Target connection - PostgreSQL (via Docker DNS)
 astro dev run connections add stackoverflow_postgres_target \
-  --conn-type postgres --conn-host 172.17.0.1 --conn-port 5433 \
+  --conn-type postgres --conn-host stackoverflow-postgres-target --conn-port 5432 \
   --conn-login postgres --conn-password "StackOverflow123!" --conn-schema stackoverflow_target
 ```
 
-**For macOS/Windows:**
-```bash
-# Source connection - SQL Server (via Docker Desktop host gateway)
-astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host host.docker.internal --conn-port 1433 \
-  --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
-
-# Target connection - PostgreSQL (via Docker Desktop host gateway)
-astro dev run connections add stackoverflow_postgres_target \
-  --conn-type postgres --conn-host host.docker.internal --conn-port 5433 \
-  --conn-login postgres --conn-password "StackOverflow123!" --conn-schema stackoverflow_target
-```
+**Note:** PostgreSQL uses port 5432 inside the container (not 5433 - that's the host port mapping).
 
 **Verification:**
 ```bash
@@ -563,18 +655,54 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd \
 docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd \
   -S localhost -U sa -P StackOverflow123! -C -Q "SELECT 'Target OK' AS Status;"
 
-# Verify Airflow connections (macOS/Windows should use host.docker.internal)
+# Verify Airflow connections (should use container names)
 astro dev run connections list | grep stackoverflow
+
+# Test network connectivity from Airflow to databases
+docker exec stackoverflow-replication-pipeline_bcd2dd-scheduler-1 \
+  timeout 5 bash -c '</dev/tcp/stackoverflow-mssql-source/1433' && echo "Source reachable" || echo "Source NOT reachable"
 ```
 
 ### Common Issues Summary
 
 | Issue | Symptom | Quick Fix |
 |-------|---------|-----------|
+| **Network disconnected after restart** | "Unable to connect", timeout errors | Reconnect databases to Airflow network (see below) |
 | **Container crashes** | Exit code 1, core dumps | Use AMD64 hardware or PostgreSQL |
 | **Auth failures** | "Login failed for user 'sa'" | Wait 45+ seconds after container start |
-| **Connection refused** | "Unable to connect" | Update connections to use `host.docker.internal` (macOS/Windows) or `172.17.0.1` (Linux) |
-| **BCP failures** | "docker: not found" | Use optimized DAG instead |
+| **Connection refused** | "Unable to connect" | Verify network connection, use container names |
+| **BULK INSERT failures** | "docker: not found", FileNotFoundError | Use `no_indexes` or `full_parallel` DAG instead (see BULK INSERT section) |
+
+### Network Disconnection After Astro Restart (CRITICAL)
+
+**Problem:**
+After running `astro dev restart`, DAGs fail with connection timeout errors:
+```
+pymssql.exceptions.OperationalError: (20009, b'Unable to connect: Adaptive Server is unavailable or does not exist (stackoverflow-mssql-source)\nNet-Lib error during Connection timed out (110)\n')
+```
+
+**Root Cause:**
+- `astro dev restart` recreates the Airflow network with a new network ID
+- Database containers lose their connection to the Airflow network
+- Airflow can no longer resolve container names or reach the databases
+
+**Solution:**
+
+Reconnect databases to the Airflow network after every `astro dev restart`:
+
+```bash
+# Reconnect both databases to the Airflow network
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-mssql-source
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-mssql-target
+
+# Verify network connectivity
+docker exec stackoverflow-replication-pipeline_bcd2dd-scheduler-1 \
+  bash -c 'timeout 5 bash -c "</dev/tcp/stackoverflow-mssql-source/1433"' \
+  && echo "Source connected successfully" || echo "Source still NOT reachable"
+```
+
+**Prevention:**
+Add these commands to your workflow after every Astro restart. They are idempotent (safe to run multiple times).
 
 ### Database File Permissions Issue (SQL Server)
 
@@ -617,6 +745,77 @@ docker exec -u root stackoverflow-mssql-source chmod 660 \
 - Database recovery completes successfully
 
 **Note:** Running `chmod` as non-root will fail with "Operation not permitted"
+
+### BULK INSERT with LocalExecutor Limitations
+
+**Problem:**
+The `replicate_stackoverflow_to_target_bulk.py` DAG fails when trying to use `docker cp` to transfer CSV files to the SQL Server container for BULK INSERT operations.
+
+**Symptoms:**
+- Tasks fail with `FileNotFoundError` or `subprocess` errors
+- Error messages about "docker: not found" or "docker: command not found"
+- Tasks retry repeatedly but continue failing
+
+**Root Cause:**
+```python
+# This approach DOES NOT WORK from Airflow containers:
+subprocess.run(f"docker cp {local_csv_file} stackoverflow-mssql-target:{container_file}", ...)
+```
+
+Airflow containers **do not have Docker installed** and **do not have access to the Docker daemon**. This makes `docker cp` commands fail.
+
+**Why Docker-in-Docker Doesn't Work:**
+1. **No Docker CLI** - Airflow containers don't include Docker binaries
+2. **No Docker Socket** - `/var/run/docker.sock` is not mounted in Airflow containers
+3. **Security/Complexity** - Docker-in-Docker (dind) requires privileged mode and is not production-safe
+
+**Recommended Solutions:**
+
+**Option 1: Use Direct INSERT VALUES Streaming** ✓ RECOMMENDED
+- Use `replicate_stackoverflow_to_target_no_indexes.py` or `replicate_stackoverflow_to_target_full_parallel.py`
+- Direct row-by-row streaming with batched INSERT VALUES
+- No intermediate files, no Docker dependencies
+- Proven performance: ~97 minutes for full 19M row dataset
+- Works reliably with LocalExecutor
+
+**Option 2: Use Shared Docker Volume** (for BULK INSERT if required)
+```bash
+# Create shared volume
+docker volume create stackoverflow-bulk-data
+
+# Mount volume in SQL Server container (recreate container)
+docker run -d --name stackoverflow-mssql-target \
+  -v stackoverflow-bulk-data:/bulk_data \
+  ... other options ...
+
+# Mount same volume in Airflow (modify docker-compose.override.yml)
+services:
+  scheduler:
+    volumes:
+      - stackoverflow-bulk-data:/bulk_data
+```
+
+Then modify DAG to:
+- Write CSV to `/bulk_data/` (visible to both containers)
+- BULK INSERT directly from `/bulk_data/{table}.csv`
+- No `docker cp` needed
+
+**Option 3: Use CeleryExecutor** (production-like)
+- Switch to CeleryExecutor with worker containers
+- Mount shared volumes in worker containers
+- More infrastructure overhead but enables distributed execution
+
+**Performance Comparison:**
+
+| Approach | Time (19M rows) | Complexity | Works with LocalExecutor? |
+|----------|-----------------|------------|---------------------------|
+| INSERT VALUES (no indexes) | ~97 min | Low | ✓ Yes |
+| INSERT VALUES (with PK) | ~120+ min | Low | ✓ Yes |
+| BULK INSERT (shared volume) | ~60-80 min | Medium | ✓ Yes (with setup) |
+| BULK INSERT (docker cp) | N/A | N/A | ✗ No (doesn't work) |
+
+**Conclusion:**
+For this project, **use the `no_indexes` or `full_parallel` DAGs** instead of the `bulk` DAG. The performance difference is minimal (<30 minutes), and the simplicity is worth it.
 
 ### SQL Server SA Authentication Issue
 
