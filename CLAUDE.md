@@ -406,6 +406,176 @@ Expected row counts (StackOverflow2010 database):
 
 ---
 
+## High-Performance Bulk Parallel PostgreSQL DAG
+
+The `replicate_stackoverflow_to_postgres_bulk_parallel` DAG provides maximum performance through:
+- **Shared volume architecture**: Direct file access (no streaming overhead)
+- **Smart parallel execution**: Dependency-aware task groups
+- **Table partitioning**: Large tables split into 500K row chunks
+- **PostgreSQL optimizations**: UNLOGGED tables, aggressive memory settings
+- **COPY command**: Native PostgreSQL bulk loading (faster than streaming)
+
+### Performance Comparison
+
+| DAG | Strategy | Estimated Time | Parallelism |
+|-----|----------|----------------|-------------|
+| replicate_stackoverflow_to_postgres | Streaming COPY | 20-30 min | Sequential |
+| replicate_stackoverflow_to_postgres_parallel | Streaming COPY | 15-20 min | Full parallel |
+| **replicate_stackoverflow_to_postgres_bulk_parallel** | **Shared volume COPY** | **8-12 min** | **Smart parallel** |
+
+### Setup Requirements
+
+**CRITICAL**: This DAG requires a shared volume between Airflow and PostgreSQL containers for direct file access.
+
+#### Step 1: Create Shared Volume Directory
+
+```bash
+# Create shared directory on host
+mkdir -p include/bulk_files
+chmod 777 include/bulk_files
+
+# This directory will be mounted in both containers:
+# - Airflow:    /usr/local/airflow/include/bulk_files/
+# - PostgreSQL: /bulk_files/
+```
+
+#### Step 2: Start PostgreSQL with Shared Volume
+
+**IMPORTANT**: You must recreate the PostgreSQL container with the shared volume mount.
+
+```bash
+# Stop and remove existing PostgreSQL container (if running)
+docker stop stackoverflow-postgres-target 2>/dev/null || true
+docker rm stackoverflow-postgres-target 2>/dev/null || true
+
+# Start PostgreSQL 16 with shared volume mount
+docker run -d --name stackoverflow-postgres-target \
+  -e "POSTGRES_PASSWORD=StackOverflow123!" \
+  -e "POSTGRES_USER=postgres" \
+  -e "POSTGRES_DB=stackoverflow_target" \
+  -v "$(pwd)/include/bulk_files":/bulk_files \
+  -p 5433:5432 postgres:16
+
+# Connect to Airflow network
+docker network connect stackoverflow-replication-pipeline_bcd2dd_airflow stackoverflow-postgres-target
+```
+
+**Note**: The `-v "$(pwd)/include/bulk_files":/bulk_files` mount allows PostgreSQL to read CSV files exported by Airflow.
+
+#### Step 3: Verify Shared Volume
+
+```bash
+# Test that PostgreSQL can see the shared directory
+docker exec stackoverflow-postgres-target ls -la /bulk_files
+
+# Expected output: drwxrwxrwx (should show directory with 777 permissions)
+```
+
+#### Step 4: Run the Bulk Parallel DAG
+
+```bash
+# Unpause and trigger the optimized bulk DAG
+astro dev run dags unpause replicate_stackoverflow_to_postgres_bulk_parallel
+astro dev run dags trigger replicate_stackoverflow_to_postgres_bulk_parallel
+```
+
+### DAG Architecture
+
+The bulk parallel DAG uses **smart dependency groups** to maximize parallelism while respecting table relationships:
+
+```
+Reset Schema
+    ↓
+Create UNLOGGED Tables (no indexes/constraints)
+    ↓
+Optimize PostgreSQL Settings
+    ↓
+[Group 1: VoteTypes, PostTypes, LinkTypes] ← Parallel export + load
+    ↓
+Users (single table, may be partitioned if > 500K rows)
+    ↓
+[Group 3: Badges, Posts] ← Parallel, Posts partitioned into chunks
+    ↓
+[Group 4: Comments, Votes, PostLinks] ← Parallel, large tables partitioned
+    ↓
+Add Indexes and Constraints
+    ↓
+Convert UNLOGGED → LOGGED (enable WAL)
+    ↓
+Align Sequences
+```
+
+### Key Features
+
+1. **Table Partitioning**
+   - Large tables (Votes, Posts, Comments) automatically split into 500K row chunks
+   - Each chunk exported to separate CSV file
+   - All chunks loaded in parallel via COPY command
+   - Example: Votes table (10M rows) → 20 partitions → 20 parallel loads
+
+2. **PostgreSQL Optimizations**
+   ```sql
+   -- Applied during bulk load
+   SET maintenance_work_mem = '1GB';
+   SET work_mem = '512MB';
+   SET synchronous_commit = OFF;
+   SET wal_buffers = '64MB';
+
+   -- Tables created as UNLOGGED (no WAL)
+   CREATE UNLOGGED TABLE ...
+
+   -- COPY with FREEZE hint
+   COPY table FROM '/bulk_files/file.csv' WITH (FORMAT CSV, FREEZE);
+   ```
+
+3. **Shared Volume Benefits**
+   - No memory buffering (direct file access)
+   - No network streaming overhead
+   - PostgreSQL COPY is faster than INSERT VALUES
+   - Parallel workers can read different files simultaneously
+
+4. **Smart Parallelism**
+   - Lookup tables load in parallel (no dependencies)
+   - User-dependent tables wait for Users
+   - Post-dependent tables wait for Posts
+   - Within each group, all tables load simultaneously
+
+### Troubleshooting
+
+**Error: "No such file or directory: '/bulk_files/TableName.csv'"**
+
+**Cause**: PostgreSQL container doesn't have the shared volume mount.
+
+**Solution**: Recreate PostgreSQL container with `-v "$(pwd)/include/bulk_files":/bulk_files` mount.
+
+**Error: "Permission denied" when PostgreSQL tries to read CSV**
+
+**Cause**: Insufficient permissions on host directory.
+
+**Solution**:
+```bash
+chmod 777 include/bulk_files
+# Also check file permissions after export
+ls -la include/bulk_files/
+```
+
+**DAG fails with "Table not found" errors**
+
+**Cause**: Source database not attached or connections not configured.
+
+**Solution**: Follow Steps 1-4 from "Alternative Setup: SQL Server to PostgreSQL Replication" section above.
+
+### When to Use Each PostgreSQL DAG
+
+| Use Case | Recommended DAG |
+|----------|-----------------|
+| **First-time setup / Testing** | `replicate_stackoverflow_to_postgres` (simple, reliable) |
+| **Development / Quick iterations** | `replicate_stackoverflow_to_postgres_parallel` (fast, no setup) |
+| **Production / Maximum performance** | `replicate_stackoverflow_to_postgres_bulk_parallel` (fastest, needs volume) |
+| **ARM64 / No shared volume support** | `replicate_stackoverflow_to_postgres_parallel` (works anywhere) |
+
+---
+
 ## Project Overview
 
 This is a **Stack Overflow End-to-End Data Replication Pipeline** using Apache Airflow 3 with support for both SQL Server and PostgreSQL targets. It demonstrates production-quality data engineering practices including memory-capped streaming replication, audit logging, and resource management for large-scale datasets.
