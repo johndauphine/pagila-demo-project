@@ -647,39 +647,21 @@ with DAG(
         python_callable=optimize_postgres_for_bulk,
     )
 
-    # Group 1: Lookup tables (parallel)
-    with TaskGroup(group_id="group1_lookup_tables") as group1:
-        for table in LOOKUP_TABLES:
-            PythonOperator(
-                task_id=f"export_load_{table}",
-                python_callable=export_and_load_table,
-                op_kwargs={"table": table},
-            )
+    # ALL TABLES IN PARALLEL - No FK constraints during load phase
+    # Create list to hold all load tasks
+    all_load_tasks = []
 
-    # Group 2: Users table (single, may be partitioned)
-    load_users = PythonOperator(
-        task_id="export_load_Users",
-        python_callable=export_and_load_table,
-        op_kwargs={"table": "Users"},
-    )
+    # All tables from all groups
+    all_tables = LOOKUP_TABLES + ["Users"] + USER_DEPENDENT_TABLES + POST_DEPENDENT_TABLES
 
-    # Group 3: User-dependent tables (parallel)
-    with TaskGroup(group_id="group3_user_dependent") as group3:
-        for table in USER_DEPENDENT_TABLES:
-            PythonOperator(
-                task_id=f"export_load_{table}",
-                python_callable=export_and_load_table,
-                op_kwargs={"table": table},
-            )
-
-    # Group 4: Post-dependent tables (parallel)
-    with TaskGroup(group_id="group4_post_dependent") as group4:
-        for table in POST_DEPENDENT_TABLES:
-            PythonOperator(
-                task_id=f"export_load_{table}",
-                python_callable=export_and_load_table,
-                op_kwargs={"table": table},
-            )
+    # Create parallel load tasks for ALL tables
+    for table in all_tables:
+        task = PythonOperator(
+            task_id=f"export_load_{table}",
+            python_callable=export_and_load_table,
+            op_kwargs={"table": table},
+        )
+        all_load_tasks.append(task)
 
     add_indexes = PythonOperator(
         task_id="add_indexes_and_constraints",
@@ -696,6 +678,7 @@ with DAG(
         python_callable=set_identity_sequences,
     )
 
-    # SMART PARALLEL DEPENDENCY GRAPH
-    # Reset → Schema → Optimize → Group 1 (parallel) → Users → Group 3 (parallel) → Group 4 (parallel) → Indexes → Convert → Sequences
-    reset_tgt >> create_schema >> optimize_pg >> group1 >> load_users >> group3 >> group4 >> add_indexes >> convert_to_logged >> fix_sequences
+    # MAXIMUM PARALLEL DEPENDENCY GRAPH
+    # All 9 tables load in parallel (no FK constraints during load phase)
+    # Reset → Schema → Optimize → ALL TABLES (parallel) → Indexes → Convert → Sequences
+    reset_tgt >> create_schema >> optimize_pg >> all_load_tasks >> add_indexes >> convert_to_logged >> fix_sequences
